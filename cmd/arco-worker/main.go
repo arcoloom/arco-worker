@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -12,27 +13,31 @@ import (
 	"syscall"
 	"time"
 
-	workerv1 "github.com/arcoloom/arco-worker/gen/proto/arcoloom/worker/v1"
+	workerv1 "github.com/arcoloom/arco-proto/gen/go/arcoloom/worker/v1"
 	workerApp "github.com/arcoloom/arco-worker/internal/worker/app"
 	workerRuntime "github.com/arcoloom/arco-worker/internal/worker/runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 type config struct {
-	ControlPlaneAddress  string
-	ControlPlaneInsecure bool
-	InstanceID           string
-	Provider             string
-	RegistrationToken    string
-	LogLevel             string
-	LogFormat            string
-	DialTimeout          time.Duration
-	RegisterTimeout      time.Duration
-	ReportTimeout        time.Duration
-	StopTimeout          time.Duration
+	ControlPlaneAddress    string
+	ControlPlaneServerName string
+	ControlPlaneCACert     string
+	ClientCertPath         string
+	ClientKeyPath          string
+	InstanceID             string
+	Provider               string
+	RegistrationToken      string
+	LogLevel               string
+	LogFormat              string
+	DialTimeout            time.Duration
+	ConnectTimeout         time.Duration
+	HeartbeatInterval      time.Duration
+	StopTimeout            time.Duration
 }
+
+const version = "0.1.0"
 
 func main() {
 	cfg, err := parseConfig(os.Args[1:])
@@ -75,8 +80,9 @@ func main() {
 			InstanceID:        cfg.InstanceID,
 			Provider:          cfg.Provider,
 			RegistrationToken: cfg.RegistrationToken,
-			RegisterTimeout:   cfg.RegisterTimeout,
-			ReportTimeout:     cfg.ReportTimeout,
+			WorkerVersion:     version,
+			ConnectTimeout:    cfg.ConnectTimeout,
+			HeartbeatInterval: cfg.HeartbeatInterval,
 			StopTimeout:       cfg.StopTimeout,
 		},
 	)
@@ -88,6 +94,7 @@ func main() {
 	logger.Info(
 		"starting arco-worker",
 		slog.String("control_plane_address", cfg.ControlPlaneAddress),
+		slog.String("control_plane_server_name", cfg.ControlPlaneServerName),
 		slog.String("instance_id", cfg.InstanceID),
 		slog.String("provider", cfg.Provider),
 		slog.String("log_format", cfg.LogFormat),
@@ -106,15 +113,18 @@ func parseConfig(args []string) (config, error) {
 
 	cfg := config{}
 	fs.StringVar(&cfg.ControlPlaneAddress, "control-plane-address", "", "Control plane gRPC address, for example 10.0.0.10:8443")
-	fs.BoolVar(&cfg.ControlPlaneInsecure, "control-plane-insecure", true, "Use insecure gRPC transport credentials")
-	fs.StringVar(&cfg.InstanceID, "instance-id", "", "Cloud instance identifier")
+	fs.StringVar(&cfg.ControlPlaneServerName, "control-plane-server-name", "", "Expected TLS server name")
+	fs.StringVar(&cfg.ControlPlaneCACert, "control-plane-ca-cert", "", "Path to the PEM-encoded CA certificate bundle")
+	fs.StringVar(&cfg.ClientCertPath, "client-cert", "", "Path to the PEM-encoded worker client certificate")
+	fs.StringVar(&cfg.ClientKeyPath, "client-key", "", "Path to the PEM-encoded worker client private key")
+	fs.StringVar(&cfg.InstanceID, "instance-id", "", "Arcoloom instance resource identifier")
 	fs.StringVar(&cfg.Provider, "provider", "", "Cloud provider name, for example aws")
 	fs.StringVar(&cfg.RegistrationToken, "registration-token", "", "Registration token issued by the control plane")
 	fs.StringVar(&cfg.LogLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	fs.StringVar(&cfg.LogFormat, "log-format", "json", "Log format: json or text")
 	fs.DurationVar(&cfg.DialTimeout, "dial-timeout", 10*time.Second, "Timeout for establishing the initial gRPC connection")
-	fs.DurationVar(&cfg.RegisterTimeout, "register-timeout", 15*time.Second, "Timeout for the register RPC")
-	fs.DurationVar(&cfg.ReportTimeout, "report-timeout", 5*time.Second, "Timeout for report RPCs")
+	fs.DurationVar(&cfg.ConnectTimeout, "connect-timeout", 15*time.Second, "Timeout for the initial worker hello and assignment handshake")
+	fs.DurationVar(&cfg.HeartbeatInterval, "heartbeat-interval", 5*time.Second, "Interval between worker heartbeats")
 	fs.DurationVar(&cfg.StopTimeout, "stop-timeout", 15*time.Second, "Timeout for graceful workload stop after SIGTERM/SIGINT")
 
 	if err := fs.Parse(args); err != nil {
@@ -124,6 +134,14 @@ func parseConfig(args []string) (config, error) {
 	switch {
 	case cfg.ControlPlaneAddress == "":
 		return config{}, fmt.Errorf("missing required flag --control-plane-address")
+	case cfg.ControlPlaneServerName == "":
+		return config{}, fmt.Errorf("missing required flag --control-plane-server-name")
+	case cfg.ControlPlaneCACert == "":
+		return config{}, fmt.Errorf("missing required flag --control-plane-ca-cert")
+	case cfg.ClientCertPath == "":
+		return config{}, fmt.Errorf("missing required flag --client-cert")
+	case cfg.ClientKeyPath == "":
+		return config{}, fmt.Errorf("missing required flag --client-key")
 	case cfg.InstanceID == "":
 		return config{}, fmt.Errorf("missing required flag --instance-id")
 	case cfg.Provider == "":
@@ -132,10 +150,10 @@ func parseConfig(args []string) (config, error) {
 		return config{}, fmt.Errorf("missing required flag --registration-token")
 	case cfg.DialTimeout <= 0:
 		return config{}, fmt.Errorf("--dial-timeout must be greater than zero")
-	case cfg.RegisterTimeout <= 0:
-		return config{}, fmt.Errorf("--register-timeout must be greater than zero")
-	case cfg.ReportTimeout <= 0:
-		return config{}, fmt.Errorf("--report-timeout must be greater than zero")
+	case cfg.ConnectTimeout <= 0:
+		return config{}, fmt.Errorf("--connect-timeout must be greater than zero")
+	case cfg.HeartbeatInterval <= 0:
+		return config{}, fmt.Errorf("--heartbeat-interval must be greater than zero")
 	case cfg.StopTimeout <= 0:
 		return config{}, fmt.Errorf("--stop-timeout must be greater than zero")
 	}
@@ -174,10 +192,28 @@ func dialControlPlane(ctx context.Context, cfg config) (*grpc.ClientConn, error)
 	dialCtx, cancel := context.WithTimeout(ctx, cfg.DialTimeout)
 	defer cancel()
 
-	transportCredentials := credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
-	if cfg.ControlPlaneInsecure {
-		transportCredentials = insecure.NewCredentials()
+	clientCertificate, err := tls.LoadX509KeyPair(cfg.ClientCertPath, cfg.ClientKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load client certificate: %w", err)
 	}
+
+	caBundle, err := os.ReadFile(cfg.ControlPlaneCACert)
+	if err != nil {
+		return nil, fmt.Errorf("read control-plane ca certificate: %w", err)
+	}
+	rootCAs := x509.NewCertPool()
+	if !rootCAs.AppendCertsFromPEM(caBundle) {
+		return nil, fmt.Errorf("parse control-plane ca certificate bundle from %s", cfg.ControlPlaneCACert)
+	}
+
+	transportCredentials := credentials.NewTLS(&tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: cfg.ControlPlaneServerName,
+		RootCAs:    rootCAs,
+		Certificates: []tls.Certificate{
+			clientCertificate,
+		},
+	})
 
 	conn, err := grpc.DialContext(
 		dialCtx,

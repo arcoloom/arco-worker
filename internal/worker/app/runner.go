@@ -4,28 +4,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync/atomic"
 	"time"
 
-	workerv1 "github.com/arcoloom/arco-worker/gen/proto/arcoloom/worker/v1"
+	workerv1 "github.com/arcoloom/arco-proto/gen/go/arcoloom/worker/v1"
 	workerRuntime "github.com/arcoloom/arco-worker/internal/worker/runtime"
 )
 
-// EngineFactory resolves the correct runtime engine for a task assignment.
 type EngineFactory func(ctx context.Context, kind workerv1.RuntimeKind) (workerRuntime.Engine, error)
 
-// RunnerConfig contains the worker identity and RPC timeout settings.
 type RunnerConfig struct {
 	InstanceID        string
 	Provider          string
 	RegistrationToken string
-	RegisterTimeout   time.Duration
-	ReportTimeout     time.Duration
+	WorkerVersion     string
+	ConnectTimeout    time.Duration
+	HeartbeatInterval time.Duration
 	StopTimeout       time.Duration
 }
 
-// Runner coordinates register, report, and workload execution.
 type Runner struct {
 	logger        *slog.Logger
 	client        ControlPlaneClient
@@ -33,7 +32,6 @@ type Runner struct {
 	config        RunnerConfig
 }
 
-// NewRunner constructs a worker runner.
 func NewRunner(logger *slog.Logger, client ControlPlaneClient, engineFactory EngineFactory, config RunnerConfig) (*Runner, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -53,11 +51,14 @@ func NewRunner(logger *slog.Logger, client ControlPlaneClient, engineFactory Eng
 	if config.RegistrationToken == "" {
 		return nil, errors.New("registration token is required")
 	}
-	if config.RegisterTimeout <= 0 {
-		config.RegisterTimeout = 15 * time.Second
+	if config.WorkerVersion == "" {
+		config.WorkerVersion = "dev"
 	}
-	if config.ReportTimeout <= 0 {
-		config.ReportTimeout = 5 * time.Second
+	if config.ConnectTimeout <= 0 {
+		config.ConnectTimeout = 15 * time.Second
+	}
+	if config.HeartbeatInterval <= 0 {
+		config.HeartbeatInterval = 5 * time.Second
 	}
 	if config.StopTimeout <= 0 {
 		config.StopTimeout = 15 * time.Second
@@ -71,48 +72,134 @@ func NewRunner(logger *slog.Logger, client ControlPlaneClient, engineFactory Eng
 	}, nil
 }
 
-// Run executes the worker lifecycle once: register, run the assigned task, and report the result.
 func (r *Runner) Run(ctx context.Context) error {
-	registerCtx, cancel := context.WithTimeout(ctx, r.config.RegisterTimeout)
-	defer cancel()
+	streamCtx, stopStream := context.WithCancel(ctx)
+	defer stopStream()
 
-	registration, err := r.client.Register(registerCtx, &workerv1.RegisterRequest{
-		InstanceId:        r.config.InstanceID,
-		Provider:          r.config.Provider,
-		RegistrationToken: r.config.RegistrationToken,
-	})
+	session, err := r.client.Connect(streamCtx)
 	if err != nil {
-		return fmt.Errorf("register worker: %w", err)
+		return fmt.Errorf("connect worker stream: %w", err)
+	}
+	defer session.CloseSend()
+
+	type handshakeResult struct {
+		workerID   string
+		assignment *workerv1.Assignment
+		err        error
+	}
+	handshakeCh := make(chan handshakeResult, 1)
+	go func() {
+		if err := session.Send(streamCtx, &workerv1.WorkerToControl{
+			Message: &workerv1.WorkerToControl_Hello{
+				Hello: &workerv1.Hello{
+					InstanceId:        r.config.InstanceID,
+					Provider:          r.config.Provider,
+					RegistrationToken: r.config.RegistrationToken,
+					WorkerVersion:     r.config.WorkerVersion,
+				},
+			},
+		}); err != nil {
+			handshakeCh <- handshakeResult{err: fmt.Errorf("send hello: %w", err)}
+			return
+		}
+
+		workerID, assignment, err := r.waitForAssignment(streamCtx, session)
+		handshakeCh <- handshakeResult{
+			workerID:   workerID,
+			assignment: assignment,
+			err:        err,
+		}
+	}()
+
+	timer := time.NewTimer(r.config.ConnectTimeout)
+	defer timer.Stop()
+
+	var (
+		workerID   string
+		assignment *workerv1.Assignment
+	)
+	select {
+	case result := <-handshakeCh:
+		if result.err != nil {
+			return result.err
+		}
+		workerID = result.workerID
+		assignment = result.assignment
+	case <-timer.C:
+		stopStream()
+		return errors.New("timed out waiting for the control plane assignment")
+	case <-ctx.Done():
+		stopStream()
+		return ctx.Err()
 	}
 
-	taskID := registration.GetTaskId()
+	if workerID == "" {
+		return errors.New("control plane returned an empty worker ID")
+	}
+	if assignment == nil {
+		return errors.New("control plane did not send an assignment")
+	}
+
+	heartbeatCtx, stopHeartbeats := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopHeartbeats()
+	go r.runHeartbeats(heartbeatCtx, session, workerID)
+
+	return r.runAssignment(ctx, session, assignment)
+}
+
+func (r *Runner) waitForAssignment(ctx context.Context, session ControlPlaneSession) (string, *workerv1.Assignment, error) {
+	workerID := ""
+	for {
+		message, err := session.Receive(ctx)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return "", nil, errors.New("control plane closed the stream before assignment")
+			}
+			return "", nil, fmt.Errorf("receive control-plane message: %w", err)
+		}
+
+		switch payload := message.GetMessage().(type) {
+		case *workerv1.ControlToWorker_HelloAck:
+			workerID = payload.HelloAck.GetWorkerId()
+		case *workerv1.ControlToWorker_Assignment:
+			return workerID, payload.Assignment, nil
+		case *workerv1.ControlToWorker_Shutdown:
+			reason := payload.Shutdown.GetReason()
+			if reason == "" {
+				reason = "control plane requested shutdown before assignment"
+			}
+			return "", nil, errors.New(reason)
+		default:
+			return "", nil, errors.New("received unsupported control-plane message")
+		}
+	}
+}
+
+func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession, assignment *workerv1.Assignment) error {
+	taskID := assignment.GetTaskId()
 	if taskID == "" {
-		return errors.New("control plane returned an empty task ID")
+		return errors.New("assignment returned an empty task ID")
 	}
 
-	engine, err := r.engineFactory(context.WithoutCancel(ctx), registration.GetRuntimeKind())
+	engine, err := r.engineFactory(context.WithoutCancel(ctx), assignment.GetRuntimeKind())
 	if err != nil {
-		r.logReportStatusError(ctx, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
-		return fmt.Errorf("resolve runtime %s: %w", registration.GetRuntimeKind().String(), err)
+		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
+		return fmt.Errorf("resolve runtime %s: %w", assignment.GetRuntimeKind().String(), err)
 	}
 
-	payload := []byte(registration.GetPayload())
-
-	if err := r.reportStatus(ctx, taskID, workerv1.TaskState_TASK_STATE_PREPARING, "preparing workload"); err != nil {
+	payload := []byte(assignment.GetPayload())
+	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_PREPARING, "preparing workload"); err != nil {
 		return err
 	}
-
 	if err := engine.Prepare(ctx, payload); err != nil {
-		r.logReportStatusError(ctx, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
+		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
 		return fmt.Errorf("prepare workload: %w", err)
 	}
-
 	if err := engine.Start(ctx, payload); err != nil {
-		r.logReportStatusError(ctx, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
+		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
 		return fmt.Errorf("start workload: %w", err)
 	}
-
-	if err := r.reportStatus(ctx, taskID, workerv1.TaskState_TASK_STATE_RUNNING, "workload started"); err != nil {
+	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_RUNNING, "workload started"); err != nil {
 		r.stopWorkload(context.Background(), taskID, engine)
 		return err
 	}
@@ -121,10 +208,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		interrupted.Store(true)
-
 		stopCtx, cancel := context.WithTimeout(context.Background(), r.config.StopTimeout)
 		defer cancel()
-
 		if stopErr := engine.Stop(stopCtx); stopErr != nil {
 			r.logger.ErrorContext(stopCtx, "failed to stop workload", slog.String("task_id", taskID), slog.String("error", stopErr.Error()))
 		}
@@ -134,13 +219,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	if waitErr == nil && interrupted.Load() && ctx.Err() != nil {
 		waitErr = ctx.Err()
 	}
-
 	if waitErr != nil {
-		r.logReportStatusError(ctx, taskID, workerv1.TaskState_TASK_STATE_FAILED, waitErr.Error())
+		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, waitErr.Error())
 		return fmt.Errorf("wait workload: %w", waitErr)
 	}
-
-	if err := r.reportStatus(ctx, taskID, workerv1.TaskState_TASK_STATE_SUCCESS, "workload finished successfully"); err != nil {
+	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_SUCCESS, "workload finished successfully"); err != nil {
 		return err
 	}
 
@@ -148,37 +231,36 @@ func (r *Runner) Run(ctx context.Context) error {
 		context.WithoutCancel(ctx),
 		"worker completed task",
 		slog.String("task_id", taskID),
-		slog.String("runtime_kind", registration.GetRuntimeKind().String()),
+		slog.String("runtime_kind", assignment.GetRuntimeKind().String()),
 	)
-
 	return nil
 }
 
-func (r *Runner) reportStatus(ctx context.Context, taskID string, state workerv1.TaskState, message string) error {
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.config.ReportTimeout)
-	defer cancel()
-
-	if err := r.client.ReportStatus(reportCtx, &workerv1.ReportStatusRequest{
-		TaskId:  taskID,
-		State:   state,
-		Message: message,
+func (r *Runner) sendStatus(ctx context.Context, session ControlPlaneSession, taskID string, state workerv1.TaskState, message string) error {
+	if err := session.Send(context.WithoutCancel(ctx), &workerv1.WorkerToControl{
+		Message: &workerv1.WorkerToControl_Status{
+			Status: &workerv1.StatusUpdate{
+				TaskId:  taskID,
+				State:   state,
+				Message: message,
+			},
+		},
 	}); err != nil {
-		return fmt.Errorf("report status %s for task %s: %w", state.String(), taskID, err)
+		return fmt.Errorf("send status %s for task %s: %w", state.String(), taskID, err)
 	}
 
 	r.logger.InfoContext(
-		reportCtx,
+		context.WithoutCancel(ctx),
 		"reported task status",
 		slog.String("task_id", taskID),
 		slog.String("state", state.String()),
 		slog.String("message", message),
 	)
-
 	return nil
 }
 
-func (r *Runner) logReportStatusError(ctx context.Context, taskID string, state workerv1.TaskState, message string) {
-	if err := r.reportStatus(ctx, taskID, state, message); err != nil {
+func (r *Runner) logStatusError(ctx context.Context, session ControlPlaneSession, taskID string, state workerv1.TaskState, message string) {
+	if err := r.sendStatus(ctx, session, taskID, state, message); err != nil {
 		r.logger.ErrorContext(
 			context.WithoutCancel(ctx),
 			"failed to report task status",
@@ -187,6 +269,27 @@ func (r *Runner) logReportStatusError(ctx context.Context, taskID string, state 
 			slog.String("message", message),
 			slog.String("error", err.Error()),
 		)
+	}
+}
+
+func (r *Runner) runHeartbeats(ctx context.Context, session ControlPlaneSession, workerID string) {
+	ticker := time.NewTicker(r.config.HeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := session.Send(context.WithoutCancel(ctx), &workerv1.WorkerToControl{
+				Message: &workerv1.WorkerToControl_Heartbeat{
+					Heartbeat: &workerv1.Heartbeat{WorkerId: workerID},
+				},
+			}); err != nil {
+				r.logger.WarnContext(context.WithoutCancel(ctx), "failed to send heartbeat", slog.String("worker_id", workerID), slog.String("error", err.Error()))
+				return
+			}
+		}
 	}
 }
 

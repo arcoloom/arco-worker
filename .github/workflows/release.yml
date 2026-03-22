@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    env:
+      LATEST_TAG: latest
+    steps:
+      - name: Check out arco-worker
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          path: arco-worker
+
+      - name: Check out arco-proto
+        uses: actions/checkout@v5
+        with:
+          repository: arcoloom/arco-proto
+          path: arco-proto
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: arco-worker/go.mod
+          cache-dependency-path: |
+            arco-worker/go.sum
+            arco-proto/go.sum
+
+      - name: Derive release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "${tag}" =~ ^v[0-9]+(\.[0-9]+)*([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "unsupported release tag: ${tag}" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          echo "tag=${tag}" >>"${GITHUB_OUTPUT}"
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+
+      - name: Build release binaries
+        working-directory: arco-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="${arch}" CGO_ENABLED=0 go build \
+              -trimpath \
+              -ldflags="-s -w -X main.version=${{ steps.meta.outputs.version }}" \
+              -o "dist/arco-worker-linux-${arch}" \
+              ./cmd/arco-worker
+          done
+
+          (
+            cd dist
+            sha256sum arco-worker-linux-amd64 arco-worker-linux-arm64 > checksums.txt
+          )
+
+      - name: Publish versioned release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: arco-worker v${{ steps.meta.outputs.version }}
+          files: |
+            arco-worker/dist/arco-worker-linux-amd64
+            arco-worker/dist/arco-worker-linux-arm64
+            arco-worker/dist/checksums.txt
+          generate_release_notes: true
+          overwrite_files: true
+
+      - name: Move rolling latest tag
+        working-directory: arco-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${LATEST_TAG}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${LATEST_TAG}" --force
+
+      - name: Publish rolling latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.LATEST_TAG }}
+          name: arco-worker latest
+          body: |
+            Rolling release tracking `${{ steps.meta.outputs.tag }}`.
+          files: |
+            arco-worker/dist/arco-worker-linux-amd64
+            arco-worker/dist/arco-worker-linux-arm64
+            arco-worker/dist/checksums.txt
+          overwrite_files: true

@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arco-worker
+    steps:
+      - name: Check out arco-worker
+        uses: actions/checkout@v5
+        with:
+          path: arco-worker
+
+      - name: Check out arco-proto
+        uses: actions/checkout@v5
+        with:
+          repository: arcoloom/arco-proto
+          path: arco-proto
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: arco-worker/go.mod
+          cache-dependency-path: |
+            arco-worker/go.sum
+            arco-proto/go.sum
+
+      - name: Run unit tests
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch:
+          - amd64
+          - arm64
+    defaults:
+      run:
+        working-directory: arco-worker
+    steps:
+      - name: Check out arco-worker
+        uses: actions/checkout@v5
+        with:
+          path: arco-worker
+
+      - name: Check out arco-proto
+        uses: actions/checkout@v5
+        with:
+          repository: arcoloom/arco-proto
+          path: arco-proto
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: arco-worker/go.mod
+          cache-dependency-path: |
+            arco-worker/go.sum
+            arco-proto/go.sum
+
+      - name: Cross-compile Linux binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          GOOS=linux GOARCH="${{ matrix.goarch }}" CGO_ENABLED=0 go build \
+            -trimpath \
+            -ldflags="-s -w -X main.version=ci-${GITHUB_SHA::7}" \
+            -o "dist/arco-worker-linux-${{ matrix.goarch }}" \
+            ./cmd/arco-worker
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arco-worker-linux-${{ matrix.goarch }}
+          path: arco-worker/dist/arco-worker-linux-${{ matrix.goarch }}
+          if-no-files-found: error
+          retention-days: 7

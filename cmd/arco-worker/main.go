@@ -37,7 +37,8 @@ type config struct {
 	StopTimeout            time.Duration
 }
 
-const version = "0.1.0"
+// version is overridden in release builds via -ldflags.
+var version = "dev"
 
 func main() {
 	cfg, err := parseConfig(os.Args[1:])
@@ -93,6 +94,7 @@ func main() {
 
 	logger.Info(
 		"starting arco-worker",
+		slog.String("version", version),
 		slog.String("control_plane_address", cfg.ControlPlaneAddress),
 		slog.String("control_plane_server_name", cfg.ControlPlaneServerName),
 		slog.String("instance_id", cfg.InstanceID),

@@ -147,7 +147,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer stopHeartbeats()
 	go r.runHeartbeats(heartbeatCtx, session, workerID)
 
-	return r.runAssignment(ctx, session, assignment)
+	if err := r.runAssignment(ctx, session, assignment); err != nil {
+		return err
+	}
+	return r.waitForControlPlaneClosure(ctx, session)
 }
 
 func (r *Runner) waitForAssignment(ctx context.Context, session ControlPlaneSession) (string, *workerv1.Assignment, error) {
@@ -187,7 +190,14 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 	engine, err := r.engineFactory(context.WithoutCancel(ctx), assignment.GetRuntimeKind())
 	if err != nil {
 		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
-		return fmt.Errorf("resolve runtime %s: %w", assignment.GetRuntimeKind().String(), err)
+		r.logger.ErrorContext(
+			context.WithoutCancel(ctx),
+			"failed to resolve runtime",
+			slog.String("task_id", taskID),
+			slog.String("runtime_kind", assignment.GetRuntimeKind().String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
 	}
 	if r.logRelay != nil {
 		r.logRelay.BindTask(session, taskID)
@@ -202,11 +212,23 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 	}
 	if err := engine.Prepare(ctx, payload); err != nil {
 		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
-		return fmt.Errorf("prepare workload: %w", err)
+		r.logger.ErrorContext(
+			context.WithoutCancel(ctx),
+			"failed to prepare workload",
+			slog.String("task_id", taskID),
+			slog.String("error", err.Error()),
+		)
+		return nil
 	}
 	if err := engine.Start(ctx, payload); err != nil {
 		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
-		return fmt.Errorf("start workload: %w", err)
+		r.logger.ErrorContext(
+			context.WithoutCancel(ctx),
+			"failed to start workload",
+			slog.String("task_id", taskID),
+			slog.String("error", err.Error()),
+		)
+		return nil
 	}
 	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_RUNNING, "workload started"); err != nil {
 		r.stopWorkload(context.Background(), taskID, engine)
@@ -230,7 +252,13 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 	}
 	if waitErr != nil {
 		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, waitErr.Error())
-		return fmt.Errorf("wait workload: %w", waitErr)
+		r.logger.ErrorContext(
+			context.WithoutCancel(ctx),
+			"workload finished with failure",
+			slog.String("task_id", taskID),
+			slog.String("error", waitErr.Error()),
+		)
+		return nil
 	}
 	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_SUCCESS, "workload finished successfully"); err != nil {
 		return err
@@ -243,6 +271,47 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 		slog.String("runtime_kind", assignment.GetRuntimeKind().String()),
 	)
 	return nil
+}
+
+func (r *Runner) waitForControlPlaneClosure(ctx context.Context, session ControlPlaneSession) error {
+	for {
+		message, err := session.Receive(ctx)
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+				return nil
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("receive control-plane message after task completion: %w", err)
+		}
+
+		switch payload := message.GetMessage().(type) {
+		case *workerv1.ControlToWorker_Shutdown:
+			reason := payload.Shutdown.GetReason()
+			if reason == "" {
+				reason = "control plane requested shutdown"
+			}
+			r.logger.InfoContext(
+				context.WithoutCancel(ctx),
+				"received control-plane shutdown",
+				slog.String("reason", reason),
+			)
+			return nil
+		case *workerv1.ControlToWorker_HelloAck, *workerv1.ControlToWorker_Assignment:
+			r.logger.WarnContext(
+				context.WithoutCancel(ctx),
+				"received unexpected control-plane message after task completion",
+				slog.String("message_type", fmt.Sprintf("%T", payload)),
+			)
+		default:
+			r.logger.WarnContext(
+				context.WithoutCancel(ctx),
+				"received unsupported control-plane message after task completion",
+				slog.String("message_type", fmt.Sprintf("%T", payload)),
+			)
+		}
+	}
 }
 
 func (r *Runner) sendStatus(ctx context.Context, session ControlPlaneSession, taskID string, state workerv1.TaskState, message string) error {

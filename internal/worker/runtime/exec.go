@@ -20,14 +20,16 @@ import (
 type ExecEngine struct {
 	logger *slog.Logger
 
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	doneCh  chan struct{}
-	waitErr error
-	logWG   sync.WaitGroup
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	doneCh     chan struct{}
+	waitErr    error
+	logEmitter LogEmitter
+	logWG      sync.WaitGroup
 }
 
 var _ Engine = (*ExecEngine)(nil)
+var _ LogEmitterAware = (*ExecEngine)(nil)
 
 // NewExecEngine constructs an Engine backed by os/exec.
 func NewExecEngine(logger *slog.Logger) *ExecEngine {
@@ -38,6 +40,12 @@ func NewExecEngine(logger *slog.Logger) *ExecEngine {
 	return &ExecEngine{
 		logger: logger,
 	}
+}
+
+func (e *ExecEngine) SetLogEmitter(emitter LogEmitter) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.logEmitter = emitter
 }
 
 // Prepare validates the payload and checks that the target command can be resolved.
@@ -89,13 +97,14 @@ func (e *ExecEngine) Start(ctx context.Context, payload []byte) error {
 		return fmt.Errorf("start command %q: %w", execPayload.Command, err)
 	}
 
+	logEmitter := e.logEmitter
 	e.cmd = cmd
 	e.doneCh = make(chan struct{})
 	e.waitErr = nil
 
 	e.logWG.Add(2)
-	go e.forwardOutput(logCtx, stdoutPipe, "stdout", cmd.Process.Pid)
-	go e.forwardOutput(logCtx, stderrPipe, "stderr", cmd.Process.Pid)
+	go e.forwardOutput(logCtx, stdoutPipe, LogStreamStdout, cmd.Process.Pid, logEmitter)
+	go e.forwardOutput(logCtx, stderrPipe, LogStreamStderr, cmd.Process.Pid, logEmitter)
 	go e.waitForExit(logCtx, cmd)
 
 	e.logger.InfoContext(
@@ -202,7 +211,7 @@ func (e *ExecEngine) waitForExit(ctx context.Context, cmd *exec.Cmd) {
 	close(doneCh)
 }
 
-func (e *ExecEngine) forwardOutput(ctx context.Context, reader io.ReadCloser, stream string, pid int) {
+func (e *ExecEngine) forwardOutput(ctx context.Context, reader io.ReadCloser, stream LogStream, pid int, emitter LogEmitter) {
 	defer e.logWG.Done()
 	defer reader.Close()
 
@@ -210,13 +219,13 @@ func (e *ExecEngine) forwardOutput(ctx context.Context, reader io.ReadCloser, st
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	for scanner.Scan() {
-		e.logger.InfoContext(
-			ctx,
-			"exec output",
-			slog.Int("pid", pid),
-			slog.String("stream", stream),
-			slog.String("line", scanner.Text()),
-		)
+		line := scanner.Text()
+		if emitter != nil {
+			emitter(LogEntry{
+				Stream: stream,
+				Line:   line,
+			})
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -224,7 +233,7 @@ func (e *ExecEngine) forwardOutput(ctx context.Context, reader io.ReadCloser, st
 			ctx,
 			"failed to read exec output",
 			slog.Int("pid", pid),
-			slog.String("stream", stream),
+			slog.String("stream", string(stream)),
 			slog.String("error", err.Error()),
 		)
 	}

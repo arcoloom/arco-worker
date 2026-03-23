@@ -17,6 +17,24 @@ type Engine interface {
 	Wait(ctx context.Context) error
 }
 
+type LogStream string
+
+const (
+	LogStreamStdout LogStream = "stdout"
+	LogStreamStderr LogStream = "stderr"
+)
+
+type LogEntry struct {
+	Stream LogStream
+	Line   string
+}
+
+type LogEmitter func(LogEntry)
+
+type LogEmitterAware interface {
+	SetLogEmitter(LogEmitter)
+}
+
 // ExecPayload describes a workload launched directly as a host process.
 type ExecPayload struct {
 	Command string            `json:"command"`

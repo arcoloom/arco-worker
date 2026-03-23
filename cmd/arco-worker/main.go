@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -47,7 +48,8 @@ func main() {
 		os.Exit(2)
 	}
 
-	logger, err := newLogger(cfg)
+	logRelay := workerApp.NewTaskLogRelay()
+	logger, err := newLogger(cfg, io.MultiWriter(os.Stdout, logRelay.WorkerWriter()))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logger error: %v\n", err)
 		os.Exit(2)
@@ -85,6 +87,7 @@ func main() {
 			ConnectTimeout:    cfg.ConnectTimeout,
 			HeartbeatInterval: cfg.HeartbeatInterval,
 			StopTimeout:       cfg.StopTimeout,
+			LogRelay:          logRelay,
 		},
 	)
 	if err != nil {
@@ -163,7 +166,7 @@ func parseConfig(args []string) (config, error) {
 	return cfg, nil
 }
 
-func newLogger(cfg config) (*slog.Logger, error) {
+func newLogger(cfg config, writer io.Writer) (*slog.Logger, error) {
 	var level slog.Level
 	switch strings.ToLower(cfg.LogLevel) {
 	case "debug":
@@ -179,12 +182,15 @@ func newLogger(cfg config) (*slog.Logger, error) {
 	}
 
 	options := &slog.HandlerOptions{Level: level}
+	if writer == nil {
+		writer = os.Stdout
+	}
 
 	switch strings.ToLower(cfg.LogFormat) {
 	case "json":
-		return slog.New(slog.NewJSONHandler(os.Stdout, options)), nil
+		return slog.New(slog.NewJSONHandler(writer, options)), nil
 	case "text":
-		return slog.New(slog.NewTextHandler(os.Stdout, options)), nil
+		return slog.New(slog.NewTextHandler(writer, options)), nil
 	default:
 		return nil, fmt.Errorf("unsupported log format %q", cfg.LogFormat)
 	}

@@ -23,6 +23,7 @@ type RunnerConfig struct {
 	ConnectTimeout    time.Duration
 	HeartbeatInterval time.Duration
 	StopTimeout       time.Duration
+	LogRelay          *TaskLogRelay
 }
 
 type Runner struct {
@@ -30,6 +31,7 @@ type Runner struct {
 	client        ControlPlaneClient
 	engineFactory EngineFactory
 	config        RunnerConfig
+	logRelay      *TaskLogRelay
 }
 
 func NewRunner(logger *slog.Logger, client ControlPlaneClient, engineFactory EngineFactory, config RunnerConfig) (*Runner, error) {
@@ -69,6 +71,7 @@ func NewRunner(logger *slog.Logger, client ControlPlaneClient, engineFactory Eng
 		client:        client,
 		engineFactory: engineFactory,
 		config:        config,
+		logRelay:      config.LogRelay,
 	}, nil
 }
 
@@ -185,6 +188,12 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 	if err != nil {
 		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, err.Error())
 		return fmt.Errorf("resolve runtime %s: %w", assignment.GetRuntimeKind().String(), err)
+	}
+	if r.logRelay != nil {
+		r.logRelay.BindTask(session, taskID)
+		if emitterAware, ok := engine.(workerRuntime.LogEmitterAware); ok {
+			emitterAware.SetLogEmitter(r.logRelay.ProgramEmitter())
+		}
 	}
 
 	payload := []byte(assignment.GetPayload())

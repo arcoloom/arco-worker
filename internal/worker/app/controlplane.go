@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"sync"
 
 	workerv1 "github.com/arcoloom/arco-proto/gen/go/arcoloom/worker/v1"
 )
@@ -40,9 +41,12 @@ type grpcBidirectionalStream interface {
 
 type grpcControlPlaneSession struct {
 	stream grpcBidirectionalStream
+	sendMu sync.Mutex
 }
 
 func (s *grpcControlPlaneSession) Send(_ context.Context, message *workerv1.WorkerToControl) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	return s.stream.Send(message)
 }
 

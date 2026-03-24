@@ -74,7 +74,7 @@ func main() {
 			case workerv1.RuntimeKind_RUNTIME_KIND_EXEC:
 				return workerRuntime.NewExecEngine(logger), nil
 			case workerv1.RuntimeKind_RUNTIME_KIND_DOCKER:
-				return nil, fmt.Errorf("runtime %s is not implemented yet", kind.String())
+				return workerRuntime.NewDockerEngine(logger), nil
 			default:
 				return nil, fmt.Errorf("runtime %s is not supported", kind.String())
 			}

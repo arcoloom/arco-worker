@@ -50,11 +50,33 @@ type StorageMount struct {
 	MountPath       string   `json:"mount_path"`
 }
 
+type SourceSpec struct {
+	Kind     string `json:"kind"`
+	URI      string `json:"uri"`
+	Revision string `json:"revision,omitempty"`
+	Path     string `json:"path,omitempty"`
+}
+
 // ExecPayload describes a workload launched directly as a host process.
 type ExecPayload struct {
-	Command string            `json:"command"`
-	Args    []string          `json:"args"`
-	Env     map[string]string `json:"env"`
-	WorkDir string            `json:"work_dir"`
-	Mounts  []StorageMount    `json:"mounts,omitempty"`
+	TaskID        string            `json:"task_id"`
+	WorkspaceRoot string            `json:"workspace_root"`
+	Source        *SourceSpec       `json:"source,omitempty"`
+	Command       string            `json:"command"`
+	Args          []string          `json:"args"`
+	Env           map[string]string `json:"env"`
+	WorkDir       string            `json:"work_dir"`
+	Mounts        []StorageMount    `json:"mounts,omitempty"`
+}
+
+// DockerPayload describes a workload launched as a Docker container.
+type DockerPayload struct {
+	TaskID        string            `json:"task_id"`
+	WorkspaceRoot string            `json:"workspace_root"`
+	Source        *SourceSpec       `json:"source,omitempty"`
+	Image         string            `json:"image"`
+	Command       []string          `json:"command,omitempty"`
+	Env           map[string]string `json:"env"`
+	WorkDir       string            `json:"work_dir"`
+	Mounts        []StorageMount    `json:"mounts,omitempty"`
 }

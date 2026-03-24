@@ -22,13 +22,14 @@ const storageDriverS3FS = "s3fs"
 type ExecEngine struct {
 	logger *slog.Logger
 
-	mu             sync.Mutex
-	cmd            *exec.Cmd
-	doneCh         chan struct{}
-	waitErr        error
-	logEmitter     LogEmitter
-	logWG          sync.WaitGroup
-	mountedStorage []mountedStorage
+	mu              sync.Mutex
+	cmd             *exec.Cmd
+	doneCh          chan struct{}
+	waitErr         error
+	logEmitter      LogEmitter
+	logWG           sync.WaitGroup
+	mountedStorage  []mountedStorage
+	preparedPayload *ExecPayload
 }
 
 type mountedStorage struct {
@@ -63,15 +64,11 @@ func (e *ExecEngine) Prepare(ctx context.Context, payload []byte) error {
 		return err
 	}
 
-	if execPayload.WorkDir != "" {
-		workDirInfo, statErr := os.Stat(execPayload.WorkDir)
-		if statErr != nil {
-			return fmt.Errorf("stat work dir %q: %w", execPayload.WorkDir, statErr)
-		}
-		if !workDirInfo.IsDir() {
-			return fmt.Errorf("work dir %q is not a directory", execPayload.WorkDir)
-		}
+	workspace, err := prepareWorkspace(ctx, e.logger, execPayload.WorkspaceRoot, execPayload.Source, execPayload.WorkDir)
+	if err != nil {
+		return err
 	}
+	execPayload.WorkDir = workspace.hostWorkDir
 
 	if err := checkCommandAvailable(ctx, execPayload); err != nil {
 		return err
@@ -83,17 +80,17 @@ func (e *ExecEngine) Prepare(ctx context.Context, payload []byte) error {
 		return err
 	}
 
+	e.mu.Lock()
+	e.preparedPayload = &execPayload
+	e.mu.Unlock()
+
 	return nil
 }
 
 // Start launches the workload and returns immediately after the process starts.
 func (e *ExecEngine) Start(ctx context.Context, payload []byte) error {
-	execPayload, err := parseExecPayload(ctx, payload)
+	execPayload, err := e.preparedExecPayload(ctx, payload)
 	if err != nil {
-		return err
-	}
-
-	if err := validateStorageMounts(execPayload.Mounts); err != nil {
 		return err
 	}
 
@@ -246,11 +243,33 @@ func (e *ExecEngine) waitForExit(ctx context.Context, cmd *exec.Cmd, mounted []m
 	e.waitErr = waitErr
 	doneCh := e.doneCh
 	e.mountedStorage = nil
+	e.preparedPayload = nil
 	e.mu.Unlock()
 
 	if doneCh != nil {
 		close(doneCh)
 	}
+}
+
+func (e *ExecEngine) preparedExecPayload(ctx context.Context, raw []byte) (ExecPayload, error) {
+	e.mu.Lock()
+	if e.preparedPayload != nil {
+		payload := *e.preparedPayload
+		e.mu.Unlock()
+		return payload, nil
+	}
+	e.mu.Unlock()
+
+	if err := e.Prepare(ctx, raw); err != nil {
+		return ExecPayload{}, err
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.preparedPayload == nil {
+		return ExecPayload{}, errors.New("exec payload was not prepared")
+	}
+	return *e.preparedPayload, nil
 }
 
 func (e *ExecEngine) forwardOutput(ctx context.Context, reader io.ReadCloser, stream LogStream, pid int, emitter LogEmitter) {
@@ -297,6 +316,9 @@ func parseExecPayload(ctx context.Context, raw []byte) (ExecPayload, error) {
 
 	if strings.TrimSpace(payload.Command) == "" {
 		return ExecPayload{}, errors.New("exec payload command is required")
+	}
+	if strings.TrimSpace(payload.WorkspaceRoot) == "" {
+		return ExecPayload{}, errors.New("exec payload workspace_root is required")
 	}
 
 	return payload, nil

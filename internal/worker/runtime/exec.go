@@ -16,16 +16,24 @@ import (
 	"syscall"
 )
 
+const storageDriverS3FS = "s3fs"
+
 // ExecEngine runs workloads as plain host processes.
 type ExecEngine struct {
 	logger *slog.Logger
 
-	mu         sync.Mutex
-	cmd        *exec.Cmd
-	doneCh     chan struct{}
-	waitErr    error
-	logEmitter LogEmitter
-	logWG      sync.WaitGroup
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	doneCh         chan struct{}
+	waitErr        error
+	logEmitter     LogEmitter
+	logWG          sync.WaitGroup
+	mountedStorage []mountedStorage
+}
+
+type mountedStorage struct {
+	mountPath  string
+	passwdFile string
 }
 
 var _ Engine = (*ExecEngine)(nil)
@@ -68,6 +76,12 @@ func (e *ExecEngine) Prepare(ctx context.Context, payload []byte) error {
 	if err := checkCommandAvailable(ctx, execPayload); err != nil {
 		return err
 	}
+	if err := validateStorageMounts(execPayload.Mounts); err != nil {
+		return err
+	}
+	if err := checkStorageTools(execPayload.Mounts); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -79,33 +93,52 @@ func (e *ExecEngine) Start(ctx context.Context, payload []byte) error {
 		return err
 	}
 
+	if err := validateStorageMounts(execPayload.Mounts); err != nil {
+		return err
+	}
+
 	cmd, stdoutPipe, stderrPipe, err := e.buildCommand(ctx, execPayload)
 	if err != nil {
 		return err
 	}
 
 	logCtx := context.WithoutCancel(ctx)
+	mounted, err := e.mountStorage(logCtx, execPayload.Mounts)
+	if err != nil {
+		return err
+	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	if e.cmd != nil {
+		e.mu.Unlock()
+		cleanupErr := e.cleanupStorage(logCtx, mounted)
+		if cleanupErr != nil {
+			return errors.Join(errors.New("exec workload already started"), cleanupErr)
+		}
 		return errors.New("exec workload already started")
 	}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start command %q: %w", execPayload.Command, err)
+		e.mu.Unlock()
+		cleanupErr := e.cleanupStorage(logCtx, mounted)
+		startErr := fmt.Errorf("start command %q: %w", execPayload.Command, err)
+		if cleanupErr != nil {
+			return errors.Join(startErr, cleanupErr)
+		}
+		return startErr
 	}
 
 	logEmitter := e.logEmitter
 	e.cmd = cmd
 	e.doneCh = make(chan struct{})
 	e.waitErr = nil
+	e.mountedStorage = mounted
 
 	e.logWG.Add(2)
 	go e.forwardOutput(logCtx, stdoutPipe, LogStreamStdout, cmd.Process.Pid, logEmitter)
 	go e.forwardOutput(logCtx, stderrPipe, LogStreamStderr, cmd.Process.Pid, logEmitter)
-	go e.waitForExit(logCtx, cmd)
+	go e.waitForExit(logCtx, cmd, mounted)
+	e.mu.Unlock()
 
 	e.logger.InfoContext(
 		logCtx,
@@ -113,6 +146,7 @@ func (e *ExecEngine) Start(ctx context.Context, payload []byte) error {
 		slog.Int("pid", cmd.Process.Pid),
 		slog.String("command", execPayload.Command),
 		slog.String("work_dir", execPayload.WorkDir),
+		slog.Int("storage_mounts", len(mounted)),
 	)
 
 	return nil
@@ -192,11 +226,15 @@ func (e *ExecEngine) buildCommand(ctx context.Context, payload ExecPayload) (*ex
 	return cmd, stdoutPipe, stderrPipe, nil
 }
 
-func (e *ExecEngine) waitForExit(ctx context.Context, cmd *exec.Cmd) {
+func (e *ExecEngine) waitForExit(ctx context.Context, cmd *exec.Cmd, mounted []mountedStorage) {
 	err := cmd.Wait()
 	e.logWG.Wait()
 
 	waitErr := normalizeExitError(err)
+	cleanupErr := e.cleanupStorage(ctx, mounted)
+	if cleanupErr != nil {
+		waitErr = errors.Join(waitErr, cleanupErr)
+	}
 	if waitErr != nil {
 		e.logger.ErrorContext(ctx, "exec workload finished with error", slog.Int("pid", cmd.Process.Pid), slog.String("error", waitErr.Error()))
 	} else {
@@ -204,11 +242,15 @@ func (e *ExecEngine) waitForExit(ctx context.Context, cmd *exec.Cmd) {
 	}
 
 	e.mu.Lock()
+	e.cmd = nil
 	e.waitErr = waitErr
 	doneCh := e.doneCh
+	e.mountedStorage = nil
 	e.mu.Unlock()
 
-	close(doneCh)
+	if doneCh != nil {
+		close(doneCh)
+	}
 }
 
 func (e *ExecEngine) forwardOutput(ctx context.Context, reader io.ReadCloser, stream LogStream, pid int, emitter LogEmitter) {
@@ -287,6 +329,255 @@ func checkCommandAvailable(ctx context.Context, payload ExecPayload) error {
 	}
 
 	return nil
+}
+
+func validateStorageMounts(mounts []StorageMount) error {
+	if len(mounts) == 0 {
+		return nil
+	}
+
+	seenPaths := make(map[string]struct{}, len(mounts))
+	for index, mount := range mounts {
+		driver := strings.TrimSpace(mount.Driver)
+		if driver == "" {
+			driver = storageDriverS3FS
+		}
+		if !strings.EqualFold(driver, storageDriverS3FS) {
+			return fmt.Errorf("mount %d uses unsupported storage driver %q", index+1, mount.Driver)
+		}
+
+		if strings.TrimSpace(mount.Bucket) == "" {
+			return fmt.Errorf("mount %d bucket is required", index+1)
+		}
+		if strings.TrimSpace(mount.Endpoint) == "" {
+			return fmt.Errorf("mount %d endpoint is required", index+1)
+		}
+		if strings.TrimSpace(mount.AccessKeyID) == "" {
+			return fmt.Errorf("mount %d access_key_id is required", index+1)
+		}
+		if strings.TrimSpace(mount.SecretAccessKey) == "" {
+			return fmt.Errorf("mount %d secret_access_key is required", index+1)
+		}
+
+		mountPath := filepath.Clean(strings.TrimSpace(mount.MountPath))
+		if mountPath == "." || !filepath.IsAbs(mountPath) {
+			return fmt.Errorf("mount %d path %q must be absolute", index+1, mount.MountPath)
+		}
+		if mountPath == string(os.PathSeparator) {
+			return fmt.Errorf("mount %d path %q cannot be /", index+1, mount.MountPath)
+		}
+		if _, exists := seenPaths[mountPath]; exists {
+			return fmt.Errorf("mount path %q is duplicated", mountPath)
+		}
+		seenPaths[mountPath] = struct{}{}
+
+		for _, option := range mount.ExtraOptions {
+			trimmed := strings.TrimSpace(option)
+			if trimmed == "" {
+				return fmt.Errorf("mount %d extra_options contains an empty entry", index+1)
+			}
+			lower := strings.ToLower(trimmed)
+			switch {
+			case lower == "use_path_request_style",
+				strings.HasPrefix(lower, "url="),
+				strings.HasPrefix(lower, "endpoint="),
+				strings.HasPrefix(lower, "passwd_file="):
+				return fmt.Errorf("mount %d extra option %q conflicts with managed s3fs options", index+1, trimmed)
+			}
+		}
+	}
+
+	return nil
+}
+
+func checkStorageTools(mounts []StorageMount) error {
+	if len(mounts) == 0 {
+		return nil
+	}
+
+	if _, err := exec.LookPath(storageDriverS3FS); err != nil {
+		return fmt.Errorf("look up %q: %w", storageDriverS3FS, err)
+	}
+	if _, _, err := unmountCommand(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *ExecEngine) mountStorage(ctx context.Context, mounts []StorageMount) ([]mountedStorage, error) {
+	if len(mounts) == 0 {
+		return []mountedStorage{}, nil
+	}
+
+	mounted := make([]mountedStorage, 0, len(mounts))
+	for index, mount := range mounts {
+		mountedItem, err := e.mountSingleStorage(ctx, mount)
+		if err != nil {
+			rollbackErr := e.cleanupStorage(ctx, mounted)
+			mountErr := fmt.Errorf("mount storage %d at %q: %w", index+1, mount.MountPath, err)
+			if rollbackErr != nil {
+				return nil, errors.Join(mountErr, rollbackErr)
+			}
+			return nil, mountErr
+		}
+		mounted = append(mounted, mountedItem)
+	}
+
+	return mounted, nil
+}
+
+func (e *ExecEngine) mountSingleStorage(ctx context.Context, mount StorageMount) (mountedStorage, error) {
+	if err := ctx.Err(); err != nil {
+		return mountedStorage{}, err
+	}
+
+	mountPath := filepath.Clean(strings.TrimSpace(mount.MountPath))
+	if err := os.MkdirAll(mountPath, 0o755); err != nil {
+		return mountedStorage{}, fmt.Errorf("create mount path %q: %w", mountPath, err)
+	}
+
+	passwdFile, err := writeS3FSPasswordFile(mount.AccessKeyID, mount.SecretAccessKey)
+	if err != nil {
+		return mountedStorage{}, err
+	}
+
+	bucketArg := strings.TrimSpace(mount.Bucket)
+	prefix := strings.Trim(strings.TrimSpace(mount.Prefix), "/")
+	if prefix != "" {
+		bucketArg = fmt.Sprintf("%s:/%s", bucketArg, prefix)
+	}
+
+	args := []string{
+		bucketArg,
+		mountPath,
+		"-o", "passwd_file=" + passwdFile,
+		"-o", "url=" + strings.TrimSpace(mount.Endpoint),
+	}
+	if mount.UsePathStyle {
+		args = append(args, "-o", "use_path_request_style")
+	}
+	if region := strings.TrimSpace(mount.Region); region != "" {
+		args = append(args, "-o", "endpoint="+region)
+	}
+	for _, option := range mount.ExtraOptions {
+		args = append(args, "-o", strings.TrimSpace(option))
+	}
+
+	command := exec.CommandContext(ctx, storageDriverS3FS, args...)
+	command.Env = storageCommandEnv(mount)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		_ = os.Remove(passwdFile)
+		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
+			return mountedStorage{}, fmt.Errorf("run s3fs: %w: %s", err, trimmed)
+		}
+		return mountedStorage{}, fmt.Errorf("run s3fs: %w", err)
+	}
+
+	e.logger.InfoContext(
+		ctx,
+		"mounted s3-compatible storage",
+		slog.String("bucket", mount.Bucket),
+		slog.String("mount_path", mountPath),
+		slog.Bool("has_prefix", prefix != ""),
+	)
+
+	return mountedStorage{
+		mountPath:  mountPath,
+		passwdFile: passwdFile,
+	}, nil
+}
+
+func (e *ExecEngine) cleanupStorage(ctx context.Context, mounts []mountedStorage) error {
+	if len(mounts) == 0 {
+		return nil
+	}
+
+	var cleanupErr error
+	for index := len(mounts) - 1; index >= 0; index-- {
+		mount := mounts[index]
+		if mount.mountPath != "" {
+			if err := unmountStorage(mount.mountPath); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			} else {
+				e.logger.InfoContext(ctx, "unmounted s3-compatible storage", slog.String("mount_path", mount.mountPath))
+			}
+		}
+		if mount.passwdFile != "" {
+			if err := os.Remove(mount.passwdFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove passwd file %q: %w", mount.passwdFile, err))
+			}
+		}
+	}
+	return cleanupErr
+}
+
+func writeS3FSPasswordFile(accessKeyID string, secretAccessKey string) (string, error) {
+	file, err := os.CreateTemp("", "arco-s3fs-passwd-*")
+	if err != nil {
+		return "", fmt.Errorf("create s3fs passwd file: %w", err)
+	}
+	path := file.Name()
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("chmod s3fs passwd file %q: %w", path, err)
+	}
+	if _, err := file.WriteString(strings.TrimSpace(accessKeyID) + ":" + strings.TrimSpace(secretAccessKey)); err != nil {
+		file.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("write s3fs passwd file %q: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close s3fs passwd file %q: %w", path, err)
+	}
+	return path, nil
+}
+
+func storageCommandEnv(mount StorageMount) []string {
+	env := mergeEnv(os.Environ(), map[string]string{
+		"AWS_ACCESS_KEY_ID":     strings.TrimSpace(mount.AccessKeyID),
+		"AWS_SECRET_ACCESS_KEY": strings.TrimSpace(mount.SecretAccessKey),
+	})
+	if token := strings.TrimSpace(mount.SessionToken); token != "" {
+		env = mergeEnv(env, map[string]string{"AWS_SESSION_TOKEN": token})
+	}
+	return env
+}
+
+func unmountStorage(mountPath string) error {
+	command, baseArgs, err := unmountCommand()
+	if err != nil {
+		return err
+	}
+
+	args := append(append([]string(nil), baseArgs...), mountPath)
+	cmd := exec.Command(command, args...)
+	output, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
+			return fmt.Errorf("unmount %q with %s: %w: %s", mountPath, command, runErr, trimmed)
+		}
+		return fmt.Errorf("unmount %q with %s: %w", mountPath, command, runErr)
+	}
+	return nil
+}
+
+func unmountCommand() (string, []string, error) {
+	for _, candidate := range []struct {
+		command string
+		args    []string
+	}{
+		{command: "fusermount3", args: []string{"-u"}},
+		{command: "fusermount", args: []string{"-u"}},
+		{command: "umount", args: []string{}},
+	} {
+		if _, err := exec.LookPath(candidate.command); err == nil {
+			return candidate.command, candidate.args, nil
+		}
+	}
+	return "", nil, errors.New("no supported unmount command found (tried fusermount3, fusermount, umount)")
 }
 
 func normalizeExitError(err error) error {

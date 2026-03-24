@@ -14,13 +14,21 @@ import (
 )
 
 type fakeControlPlaneClient struct {
-	connectCtx context.Context
-	session    ControlPlaneSession
+	connectCtx        context.Context
+	session           ControlPlaneSession
+	terminalSession   TerminalControlPlaneSession
 }
 
 func (c *fakeControlPlaneClient) Connect(ctx context.Context) (ControlPlaneSession, error) {
 	c.connectCtx = ctx
 	return c.session, nil
+}
+
+func (c *fakeControlPlaneClient) ConnectTerminal(context.Context) (TerminalControlPlaneSession, error) {
+	if c.terminalSession != nil {
+		return c.terminalSession, nil
+	}
+	return &scriptedTerminalSession{}, nil
 }
 
 type scriptedSession struct {
@@ -46,6 +54,20 @@ func (s *scriptedSession) Receive(ctx context.Context) (*workerv1.ControlToWorke
 }
 
 func (s *scriptedSession) CloseSend() error {
+	return nil
+}
+
+type scriptedTerminalSession struct{}
+
+func (s *scriptedTerminalSession) Send(context.Context, *workerv1.WorkerTerminalToControl) error {
+	return nil
+}
+
+func (s *scriptedTerminalSession) Receive(context.Context) (*workerv1.ControlToWorkerTerminal, error) {
+	return nil, io.EOF
+}
+
+func (s *scriptedTerminalSession) CloseSend() error {
 	return nil
 }
 

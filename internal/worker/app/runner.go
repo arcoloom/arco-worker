@@ -143,6 +143,23 @@ func (r *Runner) Run(ctx context.Context) error {
 		return errors.New("control plane did not send an assignment")
 	}
 
+	terminalAgent, err := NewTerminalAgent(r.logger, r.client, nil, TerminalAgentConfig{
+		InstanceID:        r.config.InstanceID,
+		Provider:          r.config.Provider,
+		RegistrationToken: r.config.RegistrationToken,
+		WorkerVersion:     r.config.WorkerVersion,
+	})
+	if err != nil {
+		return fmt.Errorf("create terminal agent: %w", err)
+	}
+	terminalCtx, stopTerminal := context.WithCancel(ctx)
+	defer stopTerminal()
+	go func() {
+		if err := terminalAgent.Run(terminalCtx); err != nil && terminalCtx.Err() == nil {
+			r.logger.WarnContext(context.WithoutCancel(ctx), "terminal agent exited", slog.String("error", err.Error()))
+		}
+	}()
+
 	heartbeatCtx, stopHeartbeats := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopHeartbeats()
 	go r.runHeartbeats(heartbeatCtx, session, workerID)

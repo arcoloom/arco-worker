@@ -4,6 +4,7 @@ go 1.26.1
 
 require (
 	github.com/arcoloom/arco-proto v0.0.0-00010101000000-000000000000
+	github.com/creack/pty v1.1.24
 	google.golang.org/grpc v1.79.2
 )
 

@@ -13,8 +13,15 @@ type ControlPlaneSession interface {
 	CloseSend() error
 }
 
+type TerminalControlPlaneSession interface {
+	Send(context.Context, *workerv1.WorkerTerminalToControl) error
+	Receive(context.Context) (*workerv1.ControlToWorkerTerminal, error)
+	CloseSend() error
+}
+
 type ControlPlaneClient interface {
 	Connect(context.Context) (ControlPlaneSession, error)
+	ConnectTerminal(context.Context) (TerminalControlPlaneSession, error)
 }
 
 type GRPCControlPlaneClient struct {
@@ -33,9 +40,23 @@ func (c *GRPCControlPlaneClient) Connect(ctx context.Context) (ControlPlaneSessi
 	return &grpcControlPlaneSession{stream: stream}, nil
 }
 
+func (c *GRPCControlPlaneClient) ConnectTerminal(ctx context.Context) (TerminalControlPlaneSession, error) {
+	stream, err := c.client.ConnectTerminal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &grpcTerminalControlPlaneSession{stream: stream}, nil
+}
+
 type grpcBidirectionalStream interface {
 	Send(*workerv1.WorkerToControl) error
 	Recv() (*workerv1.ControlToWorker, error)
+	CloseSend() error
+}
+
+type grpcTerminalBidirectionalStream interface {
+	Send(*workerv1.WorkerTerminalToControl) error
+	Recv() (*workerv1.ControlToWorkerTerminal, error)
 	CloseSend() error
 }
 
@@ -55,5 +76,24 @@ func (s *grpcControlPlaneSession) Receive(_ context.Context) (*workerv1.ControlT
 }
 
 func (s *grpcControlPlaneSession) CloseSend() error {
+	return s.stream.CloseSend()
+}
+
+type grpcTerminalControlPlaneSession struct {
+	stream grpcTerminalBidirectionalStream
+	sendMu sync.Mutex
+}
+
+func (s *grpcTerminalControlPlaneSession) Send(_ context.Context, message *workerv1.WorkerTerminalToControl) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return s.stream.Send(message)
+}
+
+func (s *grpcTerminalControlPlaneSession) Receive(_ context.Context) (*workerv1.ControlToWorkerTerminal, error) {
+	return s.stream.Recv()
+}
+
+func (s *grpcTerminalControlPlaneSession) CloseSend() error {
 	return s.stream.CloseSend()
 }

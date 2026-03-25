@@ -39,6 +39,16 @@ jobs:
             arco-worker/go.sum
             arco-proto/go.sum
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
       - name: Derive release metadata
         id: meta
         shell: bash
@@ -85,6 +95,19 @@ jobs:
             arco-worker/dist/checksums.txt
           generate_release_notes: true
           overwrite_files: true
+
+      - name: Publish registry artifacts
+        working-directory: arco-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ARCO_REGISTRY_BASE_URL: https://registry.arcoloom.com
+          ARCO_REGISTRY_BUCKET: arco-registry
+        run: |
+          python scripts/publish_registry_artifacts.py \
+            --version "${{ steps.meta.outputs.version }}" \
+            --channel latest \
+            --channel stable
 
       - name: Move rolling latest tag
         working-directory: arco-worker

@@ -14,9 +14,9 @@ import (
 )
 
 type fakeControlPlaneClient struct {
-	connectCtx        context.Context
-	session           ControlPlaneSession
-	terminalSession   TerminalControlPlaneSession
+	connectCtx      context.Context
+	session         ControlPlaneSession
+	terminalSession TerminalControlPlaneSession
 }
 
 func (c *fakeControlPlaneClient) Connect(ctx context.Context) (ControlPlaneSession, error) {
@@ -159,5 +159,41 @@ func TestRunnerTimesOutDuringHandshake(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "timed out waiting for the control plane assignment") && !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run() error = %v, want handshake timeout", err)
+	}
+}
+
+func TestRunnerExitsCleanlyOnPreAssignmentShutdown(t *testing.T) {
+	session := &scriptedSession{
+		messages: []*workerv1.ControlToWorker{
+			{
+				Message: &workerv1.ControlToWorker_Shutdown{
+					Shutdown: &workerv1.Shutdown{
+						Reason: "instance terminated before the worker connected",
+					},
+				},
+			},
+		},
+	}
+
+	client := &fakeControlPlaneClient{session: session}
+	runner, err := NewRunner(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		client,
+		func(context.Context, workerv1.RuntimeKind) (workerRuntime.Engine, error) { return fakeEngine{}, nil },
+		RunnerConfig{
+			InstanceID:        "instance-1",
+			Provider:          "aws",
+			RegistrationToken: "token-1",
+			WorkerVersion:     "test",
+			ConnectTimeout:    time.Second,
+			HeartbeatInterval: time.Hour,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewRunner() error = %v", err)
+	}
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
 	}
 }

@@ -1,12 +1,10 @@
 package runtime
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os/exec"
 	"strconv"
@@ -24,7 +22,6 @@ type DockerEngine struct {
 	doneCh          chan struct{}
 	waitErr         error
 	logEmitter      LogEmitter
-	logWG           sync.WaitGroup
 	mountedStorage  []mountedStorage
 	preparedPayload *DockerPayload
 	containerName   string
@@ -91,7 +88,11 @@ func (e *DockerEngine) Start(ctx context.Context, payload []byte) error {
 	}
 
 	containerName := dockerContainerName(dockerPayload.TaskID)
-	cmd, stdoutPipe, stderrPipe, err := e.buildCommand(ctx, dockerPayload, containerName)
+	e.mu.Lock()
+	logEmitter := e.logEmitter
+	e.mu.Unlock()
+
+	cmd, stdoutWriter, stderrWriter, err := e.buildCommand(ctx, dockerPayload, containerName, logEmitter)
 	if err != nil {
 		return err
 	}
@@ -122,17 +123,13 @@ func (e *DockerEngine) Start(ctx context.Context, payload []byte) error {
 		return startErr
 	}
 
-	logEmitter := e.logEmitter
 	e.cmd = cmd
 	e.doneCh = make(chan struct{})
 	e.waitErr = nil
 	e.mountedStorage = mounted
 	e.containerName = containerName
 
-	e.logWG.Add(2)
-	go e.forwardOutput(logCtx, stdoutPipe, LogStreamStdout, logEmitter)
-	go e.forwardOutput(logCtx, stderrPipe, LogStreamStderr, logEmitter)
-	go e.waitForExit(logCtx, cmd, mounted, containerName)
+	go e.waitForExit(logCtx, cmd, mounted, containerName, stdoutWriter, stderrWriter)
 	e.mu.Unlock()
 
 	e.logger.InfoContext(
@@ -207,7 +204,8 @@ func (e *DockerEngine) buildCommand(
 	ctx context.Context,
 	payload DockerPayload,
 	containerName string,
-) (*exec.Cmd, io.ReadCloser, io.ReadCloser, error) {
+	emitter LogEmitter,
+) (*exec.Cmd, *lineEmitterWriter, *lineEmitterWriter, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, err
 	}
@@ -241,17 +239,12 @@ func (e *DockerEngine) buildCommand(
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create docker stdout pipe: %w", err)
-	}
+	stdoutWriter := newLineEmitterWriter(LogStreamStdout, emitter)
+	stderrWriter := newLineEmitterWriter(LogStreamStderr, emitter)
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create docker stderr pipe: %w", err)
-	}
-
-	return cmd, stdoutPipe, stderrPipe, nil
+	return cmd, stdoutWriter, stderrWriter, nil
 }
 
 func (e *DockerEngine) waitForExit(
@@ -259,9 +252,12 @@ func (e *DockerEngine) waitForExit(
 	cmd *exec.Cmd,
 	mounted []mountedStorage,
 	containerName string,
+	stdoutWriter *lineEmitterWriter,
+	stderrWriter *lineEmitterWriter,
 ) {
 	err := cmd.Wait()
-	e.logWG.Wait()
+	stdoutWriter.Flush()
+	stderrWriter.Flush()
 
 	waitErr := normalizeExitError(err)
 	cleanupErr := e.cleanupStorage(ctx, mounted)
@@ -307,32 +303,6 @@ func (e *DockerEngine) preparedDockerPayload(ctx context.Context, raw []byte) (D
 		return DockerPayload{}, errors.New("docker payload was not prepared")
 	}
 	return *e.preparedPayload, nil
-}
-
-func (e *DockerEngine) forwardOutput(ctx context.Context, reader io.ReadCloser, stream LogStream, emitter LogEmitter) {
-	defer e.logWG.Done()
-	defer reader.Close()
-
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for scanner.Scan() {
-		if emitter != nil {
-			emitter(LogEntry{
-				Stream: stream,
-				Line:   scanner.Text(),
-			})
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		e.logger.WarnContext(
-			ctx,
-			"failed to read docker output",
-			slog.String("stream", string(stream)),
-			slog.String("error", err.Error()),
-		)
-	}
 }
 
 func (e *DockerEngine) mountStorage(ctx context.Context, mounts []StorageMount) ([]mountedStorage, error) {

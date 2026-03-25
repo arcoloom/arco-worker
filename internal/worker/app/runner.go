@@ -34,6 +34,14 @@ type Runner struct {
 	logRelay      *TaskLogRelay
 }
 
+type controlPlaneShutdownError struct {
+	reason string
+}
+
+func (e *controlPlaneShutdownError) Error() string {
+	return e.reason
+}
+
 func NewRunner(logger *slog.Logger, client ControlPlaneClient, engineFactory EngineFactory, config RunnerConfig) (*Runner, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -124,6 +132,15 @@ func (r *Runner) Run(ctx context.Context) error {
 	select {
 	case result := <-handshakeCh:
 		if result.err != nil {
+			var shutdownErr *controlPlaneShutdownError
+			if errors.As(result.err, &shutdownErr) {
+				r.logger.InfoContext(
+					context.WithoutCancel(ctx),
+					"control plane requested shutdown before assignment",
+					slog.String("reason", shutdownErr.reason),
+				)
+				return nil
+			}
 			return result.err
 		}
 		workerID = result.workerID
@@ -191,7 +208,7 @@ func (r *Runner) waitForAssignment(ctx context.Context, session ControlPlaneSess
 			if reason == "" {
 				reason = "control plane requested shutdown before assignment"
 			}
-			return "", nil, errors.New(reason)
+			return "", nil, &controlPlaneShutdownError{reason: reason}
 		default:
 			return "", nil, errors.New("received unsupported control-plane message")
 		}

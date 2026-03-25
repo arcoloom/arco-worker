@@ -27,7 +27,6 @@ type ExecEngine struct {
 	doneCh          chan struct{}
 	waitErr         error
 	logEmitter      LogEmitter
-	logWG           sync.WaitGroup
 	mountedStorage  []mountedStorage
 	preparedPayload *ExecPayload
 }
@@ -37,8 +36,26 @@ type mountedStorage struct {
 	passwdFile string
 }
 
+type storageMountProbeResult struct {
+	PathExists     bool
+	PathMode       os.FileMode
+	MountInfo      *storageMountInfo
+	MountInfoError error
+	ProbeError     error
+}
+
+type storageMountInfo struct {
+	MountPoint   string
+	Filesystem   string
+	Source       string
+	MountOptions string
+	SuperOptions string
+}
+
 var _ Engine = (*ExecEngine)(nil)
 var _ LogEmitterAware = (*ExecEngine)(nil)
+
+var inspectMountedStorage = defaultInspectMountedStorage
 
 // NewExecEngine constructs an Engine backed by os/exec.
 func NewExecEngine(logger *slog.Logger) *ExecEngine {
@@ -94,7 +111,11 @@ func (e *ExecEngine) Start(ctx context.Context, payload []byte) error {
 		return err
 	}
 
-	cmd, stdoutPipe, stderrPipe, err := e.buildCommand(ctx, execPayload)
+	e.mu.Lock()
+	logEmitter := e.logEmitter
+	e.mu.Unlock()
+
+	cmd, stdoutWriter, stderrWriter, err := e.buildCommand(ctx, execPayload, logEmitter)
 	if err != nil {
 		return err
 	}
@@ -125,16 +146,12 @@ func (e *ExecEngine) Start(ctx context.Context, payload []byte) error {
 		return startErr
 	}
 
-	logEmitter := e.logEmitter
 	e.cmd = cmd
 	e.doneCh = make(chan struct{})
 	e.waitErr = nil
 	e.mountedStorage = mounted
 
-	e.logWG.Add(2)
-	go e.forwardOutput(logCtx, stdoutPipe, LogStreamStdout, cmd.Process.Pid, logEmitter)
-	go e.forwardOutput(logCtx, stderrPipe, LogStreamStderr, cmd.Process.Pid, logEmitter)
-	go e.waitForExit(logCtx, cmd, mounted)
+	go e.waitForExit(logCtx, cmd, mounted, stdoutWriter, stderrWriter)
 	e.mu.Unlock()
 
 	e.logger.InfoContext(
@@ -200,7 +217,11 @@ func (e *ExecEngine) Wait(ctx context.Context) error {
 	}
 }
 
-func (e *ExecEngine) buildCommand(ctx context.Context, payload ExecPayload) (*exec.Cmd, io.ReadCloser, io.ReadCloser, error) {
+func (e *ExecEngine) buildCommand(
+	ctx context.Context,
+	payload ExecPayload,
+	emitter LogEmitter,
+) (*exec.Cmd, *lineEmitterWriter, *lineEmitterWriter, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, err
 	}
@@ -210,22 +231,24 @@ func (e *ExecEngine) buildCommand(ctx context.Context, payload ExecPayload) (*ex
 	cmd.Dir = payload.WorkDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create stdout pipe: %w", err)
-	}
+	stdoutWriter := newLineEmitterWriter(LogStreamStdout, emitter)
+	stderrWriter := newLineEmitterWriter(LogStreamStderr, emitter)
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create stderr pipe: %w", err)
-	}
-
-	return cmd, stdoutPipe, stderrPipe, nil
+	return cmd, stdoutWriter, stderrWriter, nil
 }
 
-func (e *ExecEngine) waitForExit(ctx context.Context, cmd *exec.Cmd, mounted []mountedStorage) {
+func (e *ExecEngine) waitForExit(
+	ctx context.Context,
+	cmd *exec.Cmd,
+	mounted []mountedStorage,
+	stdoutWriter *lineEmitterWriter,
+	stderrWriter *lineEmitterWriter,
+) {
 	err := cmd.Wait()
-	e.logWG.Wait()
+	stdoutWriter.Flush()
+	stderrWriter.Flush()
 
 	waitErr := normalizeExitError(err)
 	cleanupErr := e.cleanupStorage(ctx, mounted)
@@ -270,34 +293,6 @@ func (e *ExecEngine) preparedExecPayload(ctx context.Context, raw []byte) (ExecP
 		return ExecPayload{}, errors.New("exec payload was not prepared")
 	}
 	return *e.preparedPayload, nil
-}
-
-func (e *ExecEngine) forwardOutput(ctx context.Context, reader io.ReadCloser, stream LogStream, pid int, emitter LogEmitter) {
-	defer e.logWG.Done()
-	defer reader.Close()
-
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if emitter != nil {
-			emitter(LogEntry{
-				Stream: stream,
-				Line:   line,
-			})
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		e.logger.WarnContext(
-			ctx,
-			"failed to read exec output",
-			slog.Int("pid", pid),
-			slog.String("stream", string(stream)),
-			slog.String("error", err.Error()),
-		)
-	}
 }
 
 func parseExecPayload(ctx context.Context, raw []byte) (ExecPayload, error) {
@@ -496,6 +491,28 @@ func (e *ExecEngine) mountSingleStorage(ctx context.Context, mount StorageMount)
 		return mountedStorage{}, fmt.Errorf("run s3fs: %w", err)
 	}
 
+	mountedItem := mountedStorage{
+		mountPath:  mountPath,
+		passwdFile: passwdFile,
+	}
+	probe := inspectMountedStorage(mountPath)
+	if err := validateMountedStorage(mount, probe); err != nil {
+		e.logger.WarnContext(
+			ctx,
+			"s3-compatible storage mount failed validation",
+			slog.String("bucket", strings.TrimSpace(mount.Bucket)),
+			slog.String("mount_path", mountPath),
+			slog.String("diagnostics", formatStorageMountDiagnostics(probe)),
+			slog.String("error", err.Error()),
+		)
+
+		cleanupErr := e.cleanupMountedStorageAfterProbeFailure(ctx, mountedItem, probe)
+		if cleanupErr != nil {
+			return mountedStorage{}, errors.Join(err, cleanupErr)
+		}
+		return mountedStorage{}, err
+	}
+
 	e.logger.InfoContext(
 		ctx,
 		"mounted s3-compatible storage",
@@ -504,10 +521,7 @@ func (e *ExecEngine) mountSingleStorage(ctx context.Context, mount StorageMount)
 		slog.Bool("has_prefix", prefix != ""),
 	)
 
-	return mountedStorage{
-		mountPath:  mountPath,
-		passwdFile: passwdFile,
-	}, nil
+	return mountedItem, nil
 }
 
 func (e *ExecEngine) cleanupStorage(ctx context.Context, mounts []mountedStorage) error {
@@ -531,6 +545,31 @@ func (e *ExecEngine) cleanupStorage(ctx context.Context, mounts []mountedStorage
 			}
 		}
 	}
+	return cleanupErr
+}
+
+func (e *ExecEngine) cleanupMountedStorageAfterProbeFailure(
+	ctx context.Context,
+	mount mountedStorage,
+	probe storageMountProbeResult,
+) error {
+	var cleanupErr error
+
+	shouldUnmount := mount.mountPath != "" && (probe.MountInfo != nil || probe.MountInfoError != nil)
+	if shouldUnmount {
+		if err := unmountStorage(mount.mountPath); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+		} else {
+			e.logger.InfoContext(ctx, "unmounted s3-compatible storage", slog.String("mount_path", mount.mountPath))
+		}
+	}
+
+	if mount.passwdFile != "" {
+		if err := os.Remove(mount.passwdFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove passwd file %q: %w", mount.passwdFile, err))
+		}
+	}
+
 	return cleanupErr
 }
 
@@ -566,6 +605,225 @@ func storageCommandEnv(mount StorageMount) []string {
 		env = mergeEnv(env, map[string]string{"AWS_SESSION_TOKEN": token})
 	}
 	return env
+}
+
+func validateMountedStorage(mount StorageMount, probe storageMountProbeResult) error {
+	mountPath := filepath.Clean(strings.TrimSpace(mount.MountPath))
+	summary := summarizeMountedStorage(mount)
+	diagnostics := formatStorageMountDiagnostics(probe)
+
+	switch {
+	case !probe.PathExists:
+		return fmt.Errorf(
+			"s3fs reported success but mount path %q does not exist (%s); diagnostics: %s",
+			mountPath,
+			summary,
+			diagnostics,
+		)
+	case probe.MountInfo == nil && probe.MountInfoError == nil:
+		return fmt.Errorf(
+			"s3fs reported success but mount path %q is not present in /proc/self/mountinfo (%s); diagnostics: %s",
+			mountPath,
+			summary,
+			diagnostics,
+		)
+	case probe.ProbeError != nil:
+		return fmt.Errorf(
+			"s3fs reported success but mount path %q is not readable (%s): %w; diagnostics: %s",
+			mountPath,
+			summary,
+			probe.ProbeError,
+			diagnostics,
+		)
+	default:
+		return nil
+	}
+}
+
+func summarizeMountedStorage(mount StorageMount) string {
+	parts := []string{
+		fmt.Sprintf("bucket=%q", strings.TrimSpace(mount.Bucket)),
+		fmt.Sprintf("endpoint=%q", strings.TrimSpace(mount.Endpoint)),
+		fmt.Sprintf("use_path_style=%t", mount.UsePathStyle),
+		fmt.Sprintf("use_ssl=%t", mount.UseSSL),
+	}
+
+	if prefix := strings.Trim(strings.TrimSpace(mount.Prefix), "/"); prefix != "" {
+		parts = append(parts, fmt.Sprintf("prefix=%q", prefix))
+	}
+	if region := strings.TrimSpace(mount.Region); region != "" {
+		parts = append(parts, fmt.Sprintf("region=%q", region))
+	}
+	if len(mount.ExtraOptions) > 0 {
+		parts = append(parts, fmt.Sprintf("extra_options=%q", compactMountExtraOptions(mount.ExtraOptions)))
+	}
+
+	return strings.Join(parts, ", ")
+}
+
+func compactMountExtraOptions(options []string) string {
+	if len(options) == 0 {
+		return ""
+	}
+
+	items := make([]string, 0, len(options))
+	for _, option := range options {
+		if trimmed := strings.TrimSpace(option); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return strings.Join(items, ",")
+}
+
+func formatStorageMountDiagnostics(probe storageMountProbeResult) string {
+	parts := []string{fmt.Sprintf("path_exists=%t", probe.PathExists)}
+	if probe.PathExists {
+		parts = append(parts, fmt.Sprintf("path_mode=%q", probe.PathMode.String()))
+	}
+
+	if probe.MountInfo != nil {
+		parts = append(parts,
+			fmt.Sprintf("mount_source=%q", probe.MountInfo.Source),
+			fmt.Sprintf("mount_fs=%q", probe.MountInfo.Filesystem),
+		)
+		if probe.MountInfo.MountOptions != "" {
+			parts = append(parts, fmt.Sprintf("mount_options=%q", probe.MountInfo.MountOptions))
+		}
+		if probe.MountInfo.SuperOptions != "" {
+			parts = append(parts, fmt.Sprintf("super_options=%q", probe.MountInfo.SuperOptions))
+		}
+	} else if probe.MountInfoError != nil {
+		parts = append(parts, fmt.Sprintf("mountinfo_error=%q", probe.MountInfoError.Error()))
+	} else {
+		parts = append(parts, `mount_entry="missing"`)
+	}
+
+	return strings.Join(parts, ", ")
+}
+
+func defaultInspectMountedStorage(mountPath string) storageMountProbeResult {
+	result := storageMountProbeResult{}
+
+	info, err := os.Stat(mountPath)
+	switch {
+	case err == nil:
+		result.PathExists = true
+		result.PathMode = info.Mode()
+	case errors.Is(err, os.ErrNotExist):
+		return result
+	default:
+		result.ProbeError = fmt.Errorf("stat mount path: %w", err)
+	}
+
+	mountInfo, err := readSelfMountInfo(mountPath)
+	if err != nil {
+		result.MountInfoError = err
+	} else {
+		result.MountInfo = mountInfo
+	}
+
+	if !result.PathExists {
+		return result
+	}
+	if result.ProbeError != nil {
+		return result
+	}
+
+	dir, err := os.Open(mountPath)
+	if err != nil {
+		result.ProbeError = fmt.Errorf("open mount path: %w", err)
+		return result
+	}
+	defer dir.Close()
+
+	if _, err := dir.ReadDir(1); err != nil && !errors.Is(err, io.EOF) {
+		result.ProbeError = fmt.Errorf("read directory entries: %w", err)
+	}
+
+	return result
+}
+
+func readSelfMountInfo(targetPath string) (*storageMountInfo, error) {
+	file, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	targetPath = filepath.Clean(targetPath)
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		entry, err := parseMountInfoLine(scanner.Text())
+		if err != nil {
+			continue
+		}
+		if filepath.Clean(entry.MountPoint) == targetPath {
+			return entry, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan /proc/self/mountinfo: %w", err)
+	}
+
+	return nil, nil
+}
+
+func parseMountInfoLine(line string) (*storageMountInfo, error) {
+	left, right, ok := strings.Cut(line, " - ")
+	if !ok {
+		return nil, fmt.Errorf("invalid mountinfo line: missing separator")
+	}
+
+	leftFields := strings.Fields(left)
+	rightFields := strings.Fields(right)
+	if len(leftFields) < 6 || len(rightFields) < 3 {
+		return nil, fmt.Errorf("invalid mountinfo line: not enough fields")
+	}
+
+	return &storageMountInfo{
+		MountPoint:   decodeMountInfoField(leftFields[4]),
+		Filesystem:   decodeMountInfoField(rightFields[0]),
+		Source:       decodeMountInfoField(rightFields[1]),
+		MountOptions: decodeMountInfoField(leftFields[5]),
+		SuperOptions: decodeMountInfoField(strings.Join(rightFields[2:], " ")),
+	}, nil
+}
+
+func decodeMountInfoField(value string) string {
+	if !strings.Contains(value, `\`) {
+		return value
+	}
+
+	var builder strings.Builder
+	builder.Grow(len(value))
+
+	for index := 0; index < len(value); index++ {
+		if value[index] == '\\' && index+3 < len(value) {
+			octal := value[index+1 : index+4]
+			decoded, ok := decodeMountInfoOctal(octal)
+			if ok {
+				builder.WriteByte(decoded)
+				index += 3
+				continue
+			}
+		}
+		builder.WriteByte(value[index])
+	}
+
+	return builder.String()
+}
+
+func decodeMountInfoOctal(value string) (byte, bool) {
+	var decoded byte
+	for index := 0; index < len(value); index++ {
+		digit := value[index]
+		if digit < '0' || digit > '7' {
+			return 0, false
+		}
+		decoded = decoded*8 + (digit - '0')
+	}
+	return decoded, true
 }
 
 func unmountStorage(mountPath string) error {

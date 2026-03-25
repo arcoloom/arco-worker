@@ -15,11 +15,12 @@ import (
 const defaultTerminalReconnectInterval = 2 * time.Second
 
 type TerminalAgentConfig struct {
-	InstanceID         string
-	Provider           string
-	RegistrationToken  string
-	WorkerVersion      string
-	ReconnectInterval  time.Duration
+	InstanceID           string
+	Provider             string
+	RegistrationToken    string
+	WorkerVersion        string
+	TerminalSessionToken string
+	ReconnectInterval    time.Duration
 }
 
 type TerminalAgent struct {
@@ -55,6 +56,9 @@ func NewTerminalAgent(
 	}
 	if config.WorkerVersion == "" {
 		config.WorkerVersion = "dev"
+	}
+	if config.TerminalSessionToken == "" {
+		return nil, errors.New("terminal session token is required")
 	}
 	if config.ReconnectInterval <= 0 {
 		config.ReconnectInterval = defaultTerminalReconnectInterval
@@ -106,10 +110,11 @@ func (a *TerminalAgent) runOnce(ctx context.Context) error {
 	if err := session.Send(streamCtx, &workerv1.WorkerTerminalToControl{
 		Message: &workerv1.WorkerTerminalToControl_Hello{
 			Hello: &workerv1.TerminalHello{
-				InstanceId:        a.config.InstanceID,
-				Provider:          a.config.Provider,
-				RegistrationToken: a.config.RegistrationToken,
-				WorkerVersion:     a.config.WorkerVersion,
+				InstanceId:           a.config.InstanceID,
+				Provider:             a.config.Provider,
+				RegistrationToken:    a.config.RegistrationToken,
+				WorkerVersion:        a.config.WorkerVersion,
+				TerminalSessionToken: a.config.TerminalSessionToken,
 			},
 		},
 	}); err != nil {

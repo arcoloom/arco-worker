@@ -94,9 +94,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer session.CloseSend()
 
 	type handshakeResult struct {
-		workerID   string
-		assignment *workerv1.Assignment
-		err        error
+		workerID             string
+		terminalSessionToken string
+		assignment           *workerv1.Assignment
+		err                  error
 	}
 	handshakeCh := make(chan handshakeResult, 1)
 	go func() {
@@ -114,11 +115,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			return
 		}
 
-		workerID, assignment, err := r.waitForAssignment(streamCtx, session)
+		workerID, terminalSessionToken, assignment, err := r.waitForAssignment(streamCtx, session)
 		handshakeCh <- handshakeResult{
-			workerID:   workerID,
-			assignment: assignment,
-			err:        err,
+			workerID:             workerID,
+			terminalSessionToken: terminalSessionToken,
+			assignment:           assignment,
+			err:                  err,
 		}
 	}()
 
@@ -126,8 +128,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer timer.Stop()
 
 	var (
-		workerID   string
-		assignment *workerv1.Assignment
+		workerID             string
+		terminalSessionToken string
+		assignment           *workerv1.Assignment
 	)
 	select {
 	case result := <-handshakeCh:
@@ -144,6 +147,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return result.err
 		}
 		workerID = result.workerID
+		terminalSessionToken = result.terminalSessionToken
 		assignment = result.assignment
 	case <-timer.C:
 		stopStream()
@@ -159,12 +163,16 @@ func (r *Runner) Run(ctx context.Context) error {
 	if assignment == nil {
 		return errors.New("control plane did not send an assignment")
 	}
+	if terminalSessionToken == "" {
+		return errors.New("control plane did not return a terminal session token")
+	}
 
 	terminalAgent, err := NewTerminalAgent(r.logger, r.client, nil, TerminalAgentConfig{
-		InstanceID:        r.config.InstanceID,
-		Provider:          r.config.Provider,
-		RegistrationToken: r.config.RegistrationToken,
-		WorkerVersion:     r.config.WorkerVersion,
+		InstanceID:           r.config.InstanceID,
+		Provider:             r.config.Provider,
+		RegistrationToken:    r.config.RegistrationToken,
+		WorkerVersion:        r.config.WorkerVersion,
+		TerminalSessionToken: terminalSessionToken,
 	})
 	if err != nil {
 		return fmt.Errorf("create terminal agent: %w", err)
@@ -187,30 +195,32 @@ func (r *Runner) Run(ctx context.Context) error {
 	return r.waitForControlPlaneClosure(ctx, session)
 }
 
-func (r *Runner) waitForAssignment(ctx context.Context, session ControlPlaneSession) (string, *workerv1.Assignment, error) {
+func (r *Runner) waitForAssignment(ctx context.Context, session ControlPlaneSession) (string, string, *workerv1.Assignment, error) {
 	workerID := ""
+	terminalSessionToken := ""
 	for {
 		message, err := session.Receive(ctx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return "", nil, errors.New("control plane closed the stream before assignment")
+				return "", "", nil, errors.New("control plane closed the stream before assignment")
 			}
-			return "", nil, fmt.Errorf("receive control-plane message: %w", err)
+			return "", "", nil, fmt.Errorf("receive control-plane message: %w", err)
 		}
 
 		switch payload := message.GetMessage().(type) {
 		case *workerv1.ControlToWorker_HelloAck:
 			workerID = payload.HelloAck.GetWorkerId()
+			terminalSessionToken = payload.HelloAck.GetTerminalSessionToken()
 		case *workerv1.ControlToWorker_Assignment:
-			return workerID, payload.Assignment, nil
+			return workerID, terminalSessionToken, payload.Assignment, nil
 		case *workerv1.ControlToWorker_Shutdown:
 			reason := payload.Shutdown.GetReason()
 			if reason == "" {
 				reason = "control plane requested shutdown before assignment"
 			}
-			return "", nil, &controlPlaneShutdownError{reason: reason}
+			return "", "", nil, &controlPlaneShutdownError{reason: reason}
 		default:
-			return "", nil, errors.New("received unsupported control-plane message")
+			return "", "", nil, errors.New("received unsupported control-plane message")
 		}
 	}
 }

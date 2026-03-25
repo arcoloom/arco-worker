@@ -30,6 +30,7 @@ type config struct {
 	InstanceID             string
 	Provider               string
 	RegistrationToken      string
+	RegistrationTokenFile  string
 	LogLevel               string
 	LogFormat              string
 	DialTimeout            time.Duration
@@ -125,6 +126,7 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.InstanceID, "instance-id", "", "Arcoloom instance resource identifier")
 	fs.StringVar(&cfg.Provider, "provider", "", "Cloud provider name, for example aws")
 	fs.StringVar(&cfg.RegistrationToken, "registration-token", "", "Registration token issued by the control plane")
+	fs.StringVar(&cfg.RegistrationTokenFile, "registration-token-file", "", "Path to a file containing the registration token issued by the control plane")
 	fs.StringVar(&cfg.LogLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	fs.StringVar(&cfg.LogFormat, "log-format", "json", "Log format: json or text")
 	fs.DurationVar(&cfg.DialTimeout, "dial-timeout", 10*time.Second, "Timeout for establishing the initial gRPC connection")
@@ -134,6 +136,14 @@ func parseConfig(args []string) (config, error) {
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
+	}
+
+	if cfg.RegistrationToken == "" && cfg.RegistrationTokenFile != "" {
+		tokenBytes, err := os.ReadFile(cfg.RegistrationTokenFile)
+		if err != nil {
+			return config{}, fmt.Errorf("read registration token file: %w", err)
+		}
+		cfg.RegistrationToken = strings.TrimSpace(string(tokenBytes))
 	}
 
 	switch {
@@ -152,7 +162,7 @@ func parseConfig(args []string) (config, error) {
 	case cfg.Provider == "":
 		return config{}, fmt.Errorf("missing required flag --provider")
 	case cfg.RegistrationToken == "":
-		return config{}, fmt.Errorf("missing required flag --registration-token")
+		return config{}, fmt.Errorf("missing required flag --registration-token or --registration-token-file")
 	case cfg.DialTimeout <= 0:
 		return config{}, fmt.Errorf("--dial-timeout must be greater than zero")
 	case cfg.ConnectTimeout <= 0:

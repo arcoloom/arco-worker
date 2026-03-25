@@ -70,10 +70,11 @@ func TestTerminalAgentRunOnceHandlesControlMessages(t *testing.T) {
 		fakeTerminalClient{session: session},
 		manager,
 		TerminalAgentConfig{
-			InstanceID:        "instance-1",
-			Provider:          "aws",
-			RegistrationToken: "token-1",
-			WorkerVersion:     "test",
+			InstanceID:           "instance-1",
+			Provider:             "aws",
+			RegistrationToken:    "token-1",
+			WorkerVersion:        "test",
+			TerminalSessionToken: "terminal-token-1",
 		},
 	)
 	if err != nil {
@@ -89,6 +90,9 @@ func TestTerminalAgentRunOnceHandlesControlMessages(t *testing.T) {
 	}
 	if session.sentMessages[0].GetHello() == nil {
 		t.Fatalf("first sent message = %#v, want hello", session.sentMessages[0].GetMessage())
+	}
+	if got := session.sentMessages[0].GetHello().GetTerminalSessionToken(); got != "terminal-token-1" {
+		t.Fatalf("hello terminal session token = %q, want %q", got, "terminal-token-1")
 	}
 	if session.sentMessages[1].GetReady() == nil || session.sentMessages[1].GetReady().GetSessionId() != "session-1" {
 		t.Fatalf("second sent message = %#v, want ready for session-1", session.sentMessages[1].GetMessage())

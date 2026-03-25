@@ -83,7 +83,10 @@ func TestRunnerUsesUndeadlinedStreamContext(t *testing.T) {
 		messages: []*workerv1.ControlToWorker{
 			{
 				Message: &workerv1.ControlToWorker_HelloAck{
-					HelloAck: &workerv1.HelloAck{WorkerId: "worker-1"},
+					HelloAck: &workerv1.HelloAck{
+						WorkerId:             "worker-1",
+						TerminalSessionToken: "terminal-token-1",
+					},
 				},
 			},
 			{

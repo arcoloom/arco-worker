@@ -18,6 +18,13 @@ import (
 
 const storageDriverS3FS = "s3fs"
 
+type storageToolInstallStrategy struct {
+	name        string
+	command     string
+	prepareArgs [][]string
+	installArgs [][]string
+}
+
 // ExecEngine runs workloads as plain host processes.
 type ExecEngine struct {
 	logger *slog.Logger
@@ -81,6 +88,13 @@ func (e *ExecEngine) Prepare(ctx context.Context, payload []byte) error {
 		return err
 	}
 
+	if err := validateStorageMounts(execPayload.Mounts); err != nil {
+		return err
+	}
+	if err := checkStorageTools(ctx, e.logger, execPayload.Mounts); err != nil {
+		return err
+	}
+
 	workspace, err := prepareWorkspace(ctx, e.logger, execPayload.WorkspaceRoot, execPayload.Source, execPayload.WorkDir)
 	if err != nil {
 		return err
@@ -88,12 +102,6 @@ func (e *ExecEngine) Prepare(ctx context.Context, payload []byte) error {
 	execPayload.WorkDir = workspace.hostWorkDir
 
 	if err := checkCommandAvailable(ctx, execPayload); err != nil {
-		return err
-	}
-	if err := validateStorageMounts(execPayload.Mounts); err != nil {
-		return err
-	}
-	if err := checkStorageTools(execPayload.Mounts); err != nil {
 		return err
 	}
 
@@ -416,17 +424,212 @@ func validateStorageMounts(mounts []StorageMount) error {
 	return nil
 }
 
-func checkStorageTools(mounts []StorageMount) error {
+func checkStorageTools(ctx context.Context, logger *slog.Logger, mounts []StorageMount) error {
 	if len(mounts) == 0 {
 		return nil
 	}
 
-	if _, err := exec.LookPath(storageDriverS3FS); err != nil {
-		return fmt.Errorf("look up %q: %w", storageDriverS3FS, err)
+	if err := ensureS3FSAvailable(ctx, logger); err != nil {
+		return err
 	}
 	if _, _, err := unmountCommand(); err != nil {
 		return err
 	}
+	return nil
+}
+
+func ensureS3FSAvailable(ctx context.Context, logger *slog.Logger) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	_, pathErr := exec.LookPath(storageDriverS3FS)
+	if pathErr == nil {
+		return nil
+	}
+
+	if installErr := installS3FS(ctx, logger); installErr != nil {
+		return fmt.Errorf("look up %q: %w; automatic install failed: %w", storageDriverS3FS, pathErr, installErr)
+	}
+
+	if _, err := exec.LookPath(storageDriverS3FS); err != nil {
+		return fmt.Errorf("look up %q after automatic install: %w", storageDriverS3FS, err)
+	}
+
+	return nil
+}
+
+func installS3FS(ctx context.Context, logger *slog.Logger) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	strategies := []storageToolInstallStrategy{
+		{
+			name:        "apt-get",
+			command:     "apt-get",
+			prepareArgs: [][]string{{"update"}},
+			installArgs: [][]string{{"install", "-y", "s3fs"}},
+		},
+		{
+			name:        "dnf",
+			command:     "dnf",
+			installArgs: [][]string{{"install", "-y", "s3fs-fuse"}, {"install", "-y", "s3fs"}},
+		},
+		{
+			name:        "microdnf",
+			command:     "microdnf",
+			installArgs: [][]string{{"install", "-y", "s3fs-fuse"}, {"install", "-y", "s3fs"}},
+		},
+		{
+			name:        "yum",
+			command:     "yum",
+			installArgs: [][]string{{"install", "-y", "s3fs-fuse"}, {"install", "-y", "s3fs"}},
+		},
+		{
+			name:        "apk",
+			command:     "apk",
+			installArgs: [][]string{{"add", "--no-cache", "s3fs-fuse"}, {"add", "--no-cache", "s3fs"}},
+		},
+		{
+			name:        "pacman",
+			command:     "pacman",
+			installArgs: [][]string{{"-Sy", "--noconfirm", "s3fs-fuse"}, {"-Sy", "--noconfirm", "s3fs"}},
+		},
+		{
+			name:        "zypper",
+			command:     "zypper",
+			installArgs: [][]string{{"--non-interactive", "install", "-y", "s3fs"}, {"--non-interactive", "install", "-y", "s3fs-fuse"}},
+		},
+		{
+			name:        "brew",
+			command:     "brew",
+			installArgs: [][]string{{"install", "s3fs"}},
+		},
+	}
+
+	var attemptErrors []string
+	supportedManagers := make([]string, 0, len(strategies))
+	for _, strategy := range strategies {
+		supportedManagers = append(supportedManagers, strategy.name)
+		if _, err := exec.LookPath(strategy.command); err != nil {
+			continue
+		}
+
+		if logger != nil {
+			logger.InfoContext(ctx, "attempting automatic s3fs install", slog.String("package_manager", strategy.name))
+		}
+
+		if err := runStorageInstallStrategy(ctx, strategy); err != nil {
+			attemptErrors = append(attemptErrors, fmt.Sprintf("%s: %s", strategy.name, err.Error()))
+			if logger != nil {
+				logger.WarnContext(
+					ctx,
+					"automatic s3fs install attempt failed",
+					slog.String("package_manager", strategy.name),
+					slog.String("error", err.Error()),
+				)
+			}
+			continue
+		}
+
+		if logger != nil {
+			logger.InfoContext(ctx, "installed s3fs automatically", slog.String("package_manager", strategy.name))
+		}
+		return nil
+	}
+
+	if len(attemptErrors) == 0 {
+		return fmt.Errorf(
+			"no supported package manager found to install %q (tried %s)",
+			storageDriverS3FS,
+			strings.Join(supportedManagers, ", "),
+		)
+	}
+
+	return errors.New(strings.Join(attemptErrors, "; "))
+}
+
+func runStorageInstallStrategy(ctx context.Context, strategy storageToolInstallStrategy) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	prefixes := [][]string{{}}
+	if os.Geteuid() != 0 {
+		if _, err := exec.LookPath("sudo"); err == nil {
+			prefixes = append(prefixes, []string{"sudo", "-n"})
+		}
+	}
+
+	var attemptErrors []string
+	for _, prefix := range prefixes {
+		if err := runStorageInstallCommands(ctx, strategy.command, strategy.prepareArgs, prefix); err != nil {
+			attemptErrors = append(attemptErrors, err.Error())
+			continue
+		}
+
+		var installErrors []string
+		for _, args := range strategy.installArgs {
+			if err := runStorageInstallCommand(ctx, strategy.command, args, prefix); err != nil {
+				installErrors = append(installErrors, err.Error())
+				continue
+			}
+			return nil
+		}
+		if len(installErrors) > 0 {
+			attemptErrors = append(attemptErrors, strings.Join(installErrors, "; "))
+		}
+	}
+
+	if len(attemptErrors) == 0 {
+		return fmt.Errorf("no install commands configured for %s", strategy.name)
+	}
+
+	return errors.New(strings.Join(attemptErrors, "; "))
+}
+
+func runStorageInstallCommands(ctx context.Context, command string, commands [][]string, prefix []string) error {
+	for _, args := range commands {
+		if len(args) == 0 {
+			continue
+		}
+		if err := runStorageInstallCommand(ctx, command, args, prefix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runStorageInstallCommand(ctx context.Context, command string, args []string, prefix []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	runCommand := command
+	runArgs := append([]string(nil), args...)
+	displayParts := append([]string(nil), prefix...)
+	displayParts = append(displayParts, command)
+	displayParts = append(displayParts, args...)
+
+	if len(prefix) > 0 {
+		runCommand = prefix[0]
+		runArgs = append(append([]string(nil), prefix[1:]...), command)
+		runArgs = append(runArgs, args...)
+	}
+
+	cmd := exec.CommandContext(ctx, runCommand, runArgs...)
+	cmd.Env = mergeEnv(os.Environ(), map[string]string{
+		"DEBIAN_FRONTEND": "noninteractive",
+	})
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
+			return fmt.Errorf("%s: %w: %s", strings.Join(displayParts, " "), err, trimmed)
+		}
+		return fmt.Errorf("%s: %w", strings.Join(displayParts, " "), err)
+	}
+
 	return nil
 }
 

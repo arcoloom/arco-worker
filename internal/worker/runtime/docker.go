@@ -59,7 +59,7 @@ func (e *DockerEngine) Prepare(ctx context.Context, payload []byte) error {
 	if err := validateStorageMounts(dockerPayload.Mounts); err != nil {
 		return err
 	}
-	if err := checkStorageTools(dockerPayload.Mounts); err != nil {
+	if err := checkStorageTools(ctx, e.logger, dockerPayload.Mounts); err != nil {
 		return err
 	}
 

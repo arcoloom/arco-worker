@@ -203,6 +203,72 @@ func TestMountSingleStorageReportsMissingMountEntry(t *testing.T) {
 	}
 }
 
+func TestCheckStorageToolsInstallsS3FSAutomatically(t *testing.T) {
+	tempDir := t.TempDir()
+	prependFakeCommand(t, tempDir, "apt-get", `#!/bin/sh
+set -eu
+case "${1:-}" in
+	update)
+		exit 0
+		;;
+	install)
+		dir=${0%/*}
+		printf '%s\n' '#!/bin/sh' 'exit 0' >"$dir/s3fs"
+		/bin/chmod 0755 "$dir/s3fs"
+		exit 0
+		;;
+esac
+echo "unexpected apt-get arguments: $*" >&2
+exit 1
+`)
+	prependFakeCommand(t, tempDir, "fusermount3", "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", tempDir)
+
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
+
+	if err := checkStorageTools(context.Background(), logger, []StorageMount{{MountPath: "/mnt/data"}}); err != nil {
+		t.Fatalf("checkStorageTools() error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(tempDir, "s3fs")); err != nil {
+		t.Fatalf("installed s3fs binary missing: %v", err)
+	}
+	if !strings.Contains(logBuffer.String(), "installed s3fs automatically") {
+		t.Fatalf("expected installation log entry, got %s", logBuffer.String())
+	}
+}
+
+func TestCheckStorageToolsReportsAutomaticInstallFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	prependFakeCommand(t, tempDir, "apt-get", "#!/bin/sh\necho 'repo unavailable' >&2\nexit 1\n")
+	prependFakeCommand(t, tempDir, "fusermount3", "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", tempDir)
+
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
+
+	err := checkStorageTools(context.Background(), logger, []StorageMount{{MountPath: "/mnt/data"}})
+	if err == nil {
+		t.Fatal("checkStorageTools() error = nil, want automatic install failure")
+	}
+
+	message := err.Error()
+	for _, fragment := range []string{
+		`look up "s3fs"`,
+		`automatic install failed`,
+		`apt-get`,
+		`repo unavailable`,
+	} {
+		if !strings.Contains(message, fragment) {
+			t.Fatalf("checkStorageTools() error = %q, want fragment %q", message, fragment)
+		}
+	}
+	if !strings.Contains(logBuffer.String(), "automatic s3fs install attempt failed") {
+		t.Fatalf("expected install failure log entry, got %s", logBuffer.String())
+	}
+}
+
 func prependFakeCommand(t *testing.T, dir string, name string, body string) {
 	t.Helper()
 

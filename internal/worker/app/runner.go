@@ -11,9 +11,16 @@ import (
 
 	workerv1 "github.com/arcoloom/arco-proto/gen/go/arcoloom/worker/v1"
 	workerRuntime "github.com/arcoloom/arco-worker/internal/worker/runtime"
+	workerShutdown "github.com/arcoloom/arco-worker/internal/worker/shutdown"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type EngineFactory func(ctx context.Context, kind workerv1.RuntimeKind) (workerRuntime.Engine, error)
+type ShutdownMonitor interface {
+	Run(context.Context) error
+}
+
+type ShutdownMonitorFactory func(*slog.Logger, workerShutdown.Reporter, workerShutdown.MonitorConfig) ShutdownMonitor
 
 type RunnerConfig struct {
 	InstanceID        string
@@ -24,14 +31,16 @@ type RunnerConfig struct {
 	HeartbeatInterval time.Duration
 	StopTimeout       time.Duration
 	LogRelay          *TaskLogRelay
+	ShutdownMonitor   ShutdownMonitorFactory
 }
 
 type Runner struct {
-	logger        *slog.Logger
-	client        ControlPlaneClient
-	engineFactory EngineFactory
-	config        RunnerConfig
-	logRelay      *TaskLogRelay
+	logger         *slog.Logger
+	client         ControlPlaneClient
+	engineFactory  EngineFactory
+	monitorFactory ShutdownMonitorFactory
+	config         RunnerConfig
+	logRelay       *TaskLogRelay
 }
 
 type controlPlaneShutdownError struct {
@@ -75,11 +84,12 @@ func NewRunner(logger *slog.Logger, client ControlPlaneClient, engineFactory Eng
 	}
 
 	return &Runner{
-		logger:        logger,
-		client:        client,
-		engineFactory: engineFactory,
-		config:        config,
-		logRelay:      config.LogRelay,
+		logger:         logger,
+		client:         client,
+		engineFactory:  engineFactory,
+		monitorFactory: nonNilShutdownMonitorFactory(config.ShutdownMonitor),
+		config:         config,
+		logRelay:       config.LogRelay,
 	}, nil
 }
 
@@ -251,6 +261,9 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 	}
 
 	payload := []byte(assignment.GetPayload())
+	monitorCtx, stopMonitor := context.WithCancel(ctx)
+	defer stopMonitor()
+	r.startShutdownMonitor(monitorCtx, session, taskID, payload)
 	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_PREPARING, "preparing workload"); err != nil {
 		return err
 	}
@@ -427,4 +440,76 @@ func (r *Runner) stopWorkload(ctx context.Context, taskID string, engine workerR
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneSession, taskID string, payload []byte) {
+	if r.monitorFactory == nil {
+		return
+	}
+	config := workerShutdown.MonitorConfigFromAssignment(payload, r.config.Provider)
+	if !config.Enabled {
+		return
+	}
+	monitor := r.monitorFactory(r.logger, &shutdownReporter{
+		logger:  r.logger,
+		session: session,
+		taskID:  taskID,
+	}, config)
+	if monitor == nil {
+		return
+	}
+	go func() {
+		if err := monitor.Run(ctx); err != nil && ctx.Err() == nil {
+			r.logger.WarnContext(
+				context.WithoutCancel(ctx),
+				"shutdown monitor exited",
+				slog.String("provider", config.Provider),
+				slog.String("error", err.Error()),
+			)
+		}
+	}()
+}
+
+func nonNilShutdownMonitorFactory(factory ShutdownMonitorFactory) ShutdownMonitorFactory {
+	if factory != nil {
+		return factory
+	}
+	return func(logger *slog.Logger, reporter workerShutdown.Reporter, config workerShutdown.MonitorConfig) ShutdownMonitor {
+		return workerShutdown.NewMonitor(logger, reporter, config, nil)
+	}
+}
+
+type shutdownReporter struct {
+	logger  *slog.Logger
+	session ControlPlaneSession
+	taskID  string
+}
+
+func (r *shutdownReporter) ReportNotice(ctx context.Context, notice workerShutdown.Notice) error {
+	if r == nil || r.session == nil {
+		return errors.New("shutdown reporter session is required")
+	}
+	signal := &workerv1.Signal{
+		TaskId:     r.taskID,
+		SignalType: workerv1.SignalType_SIGNAL_TYPE_SPOT_RECLAIM_RISK,
+		Detail:     notice.Detail,
+	}
+	if !notice.ShutdownAt.IsZero() {
+		signal.ShutdownAt = timestamppb.New(notice.ShutdownAt.UTC())
+	}
+	if err := r.session.Send(ctx, &workerv1.WorkerToControl{
+		Message: &workerv1.WorkerToControl_Signal{Signal: signal},
+	}); err != nil {
+		return fmt.Errorf("send shutdown signal for task %s: %w", r.taskID, err)
+	}
+	if r.logger != nil {
+		r.logger.InfoContext(
+			context.WithoutCancel(ctx),
+			"reported shutdown notice",
+			slog.String("task_id", r.taskID),
+			slog.String("provider", notice.Provider),
+			slog.String("detail", notice.Detail),
+		)
+	}
+	return nil
 }

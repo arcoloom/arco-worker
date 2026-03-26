@@ -59,8 +59,25 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	localState := workerApp.NewLocalState(workerApp.LocalStateConfig{
+		APIAddress:             workerApp.DefaultLocalAPIListenAddress,
+		InstanceID:             cfg.InstanceID,
+		Provider:               cfg.Provider,
+		WorkerVersion:          version,
+		ControlPlaneAddress:    cfg.ControlPlaneAddress,
+		ControlPlaneServerName: cfg.ControlPlaneServerName,
+		ConnectTimeout:         cfg.ConnectTimeout,
+		HeartbeatInterval:      cfg.HeartbeatInterval,
+		StopTimeout:            cfg.StopTimeout,
+	})
+	localServer := workerApp.NewLocalAPIServer(logger, localState, workerApp.LocalAPIServerConfig{})
+	if err := localServer.Start(ctx); err != nil {
+		logger.Warn("failed to start local worker api", slog.String("address", workerApp.DefaultLocalAPIListenAddress), slog.String("error", err.Error()))
+	}
+
 	conn, err := dialControlPlane(ctx, cfg)
 	if err != nil {
+		localState.SetPhase("failed", err.Error())
 		logger.Error("failed to connect to control plane", slog.String("address", cfg.ControlPlaneAddress), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
@@ -89,9 +106,11 @@ func main() {
 			HeartbeatInterval: cfg.HeartbeatInterval,
 			StopTimeout:       cfg.StopTimeout,
 			LogRelay:          logRelay,
+			LocalState:        localState,
 		},
 	)
 	if err != nil {
+		localState.SetPhase("failed", err.Error())
 		logger.Error("failed to create worker runner", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
@@ -105,9 +124,11 @@ func main() {
 		slog.String("provider", cfg.Provider),
 		slog.String("log_format", cfg.LogFormat),
 		slog.String("log_level", strings.ToLower(cfg.LogLevel)),
+		slog.String("local_api_address", workerApp.DefaultLocalAPIListenAddress),
 	)
 
 	if err := runner.Run(ctx); err != nil {
+		localState.SetPhase("failed", err.Error())
 		logger.Error("worker exited with error", slog.String("error", err.Error()))
 		os.Exit(1)
 	}

@@ -33,6 +33,7 @@ type RunnerConfig struct {
 	StopTimeout       time.Duration
 	LogRelay          *TaskLogRelay
 	ShutdownMonitor   ShutdownMonitorFactory
+	LocalState        *LocalState
 }
 
 type Runner struct {
@@ -42,6 +43,7 @@ type Runner struct {
 	monitorFactory ShutdownMonitorFactory
 	config         RunnerConfig
 	logRelay       *TaskLogRelay
+	localState     *LocalState
 }
 
 type controlPlaneShutdownError struct {
@@ -96,18 +98,29 @@ func NewRunner(logger *slog.Logger, client ControlPlaneClient, engineFactory Eng
 		monitorFactory: nonNilShutdownMonitorFactory(config.ShutdownMonitor),
 		config:         config,
 		logRelay:       config.LogRelay,
+		localState:     config.LocalState,
 	}, nil
 }
 
 func (r *Runner) Run(ctx context.Context) error {
+	if r.localState != nil {
+		r.localState.SetPhase("connecting", "connecting to control plane")
+	}
+
 	streamCtx, stopStream := context.WithCancel(ctx)
 	defer stopStream()
 
 	session, err := r.client.Connect(streamCtx)
 	if err != nil {
+		if r.localState != nil {
+			r.localState.SetPhase("failed", err.Error())
+		}
 		return fmt.Errorf("connect worker stream: %w", err)
 	}
 	defer session.CloseSend()
+	if r.localState != nil {
+		r.localState.MarkControlPlaneConnected()
+	}
 
 	type handshakeResult struct {
 		workerID             string
@@ -153,6 +166,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		if result.err != nil {
 			var shutdownErr *controlPlaneShutdownError
 			if errors.As(result.err, &shutdownErr) {
+				if r.localState != nil {
+					r.localState.RecordShutdownRequest("control-plane", shutdownErr.reason, 0)
+					r.localState.SetPhase("stopped", shutdownErr.reason)
+				}
 				r.logger.InfoContext(
 					context.WithoutCancel(ctx),
 					"control plane requested shutdown before assignment",
@@ -167,20 +184,38 @@ func (r *Runner) Run(ctx context.Context) error {
 		assignment = result.assignment
 	case <-timer.C:
 		stopStream()
+		if r.localState != nil {
+			r.localState.SetPhase("failed", "timed out waiting for the control plane assignment")
+		}
 		return errors.New("timed out waiting for the control plane assignment")
 	case <-ctx.Done():
 		stopStream()
+		if r.localState != nil {
+			r.localState.SetPhase("stopped", ctx.Err().Error())
+		}
 		return ctx.Err()
 	}
 
 	if workerID == "" {
+		if r.localState != nil {
+			r.localState.SetPhase("failed", "control plane returned an empty worker ID")
+		}
 		return errors.New("control plane returned an empty worker ID")
 	}
 	if assignment == nil {
+		if r.localState != nil {
+			r.localState.SetPhase("failed", "control plane did not send an assignment")
+		}
 		return errors.New("control plane did not send an assignment")
 	}
 	if terminalSessionToken == "" {
+		if r.localState != nil {
+			r.localState.SetPhase("failed", "control plane did not return a terminal session token")
+		}
 		return errors.New("control plane did not return a terminal session token")
+	}
+	if r.localState != nil {
+		r.localState.SetAssignment(assignment)
 	}
 
 	terminalAgent, err := NewTerminalAgent(r.logger, r.client, nil, TerminalAgentConfig{
@@ -206,6 +241,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	go r.runHeartbeats(heartbeatCtx, session, workerID)
 
 	if err := r.runAssignment(ctx, session, assignment); err != nil {
+		if r.localState != nil {
+			r.localState.SetPhase("failed", err.Error())
+		}
 		return err
 	}
 	return r.waitForControlPlaneClosure(ctx, session)
@@ -227,6 +265,9 @@ func (r *Runner) waitForAssignment(ctx context.Context, session ControlPlaneSess
 		case *workerv1.ControlToWorker_HelloAck:
 			workerID = payload.HelloAck.GetWorkerId()
 			terminalSessionToken = payload.HelloAck.GetTerminalSessionToken()
+			if r.localState != nil {
+				r.localState.MarkWorkerConnected(workerID)
+			}
 		case *workerv1.ControlToWorker_Assignment:
 			return workerID, terminalSessionToken, payload.Assignment, nil
 		case *workerv1.ControlToWorker_Shutdown:
@@ -332,6 +373,9 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 			shutdownTriggered = true
 			shutdownReason = nonEmptyString(request.reason, "shutdown requested")
 			shutdownSource = request.source
+			if r.localState != nil {
+				r.localState.RecordShutdownRequest(shutdownSource, shutdownReason, gracePeriod)
+			}
 			if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_STOPPING, stoppingMessage(shutdownSource, shutdownReason, gracePeriod)); err != nil {
 				return err
 			}
@@ -423,6 +467,9 @@ func (r *Runner) waitForControlPlaneClosure(ctx context.Context, session Control
 }
 
 func (r *Runner) sendStatus(ctx context.Context, session ControlPlaneSession, taskID string, state workerv1.TaskState, message string) error {
+	if r.localState != nil {
+		r.localState.UpdateTaskState(taskID, state, message)
+	}
 	if err := session.Send(context.WithoutCancel(ctx), &workerv1.WorkerToControl{
 		Message: &workerv1.WorkerToControl_Status{
 			Status: &workerv1.StatusUpdate{
@@ -475,6 +522,9 @@ func (r *Runner) runHeartbeats(ctx context.Context, session ControlPlaneSession,
 				r.logger.WarnContext(context.WithoutCancel(ctx), "failed to send heartbeat", slog.String("worker_id", workerID), slog.String("error", err.Error()))
 				return
 			}
+			if r.localState != nil {
+				r.localState.MarkHeartbeatSent()
+			}
 		}
 	}
 }
@@ -512,6 +562,9 @@ func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneS
 		return
 	}
 	config := workerShutdown.MonitorConfigFromAssignment(payload, r.config.Provider)
+	if r.localState != nil {
+		r.localState.SetShutdownMonitor(config)
+	}
 	if !config.Enabled {
 		return
 	}
@@ -519,6 +572,7 @@ func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneS
 		logger:  r.logger,
 		session: session,
 		taskID:  taskID,
+		state:   r.localState,
 		onNotice: func(notice workerShutdown.Notice) {
 			enqueueShutdownRequest(requests, shutdownRequest{source: "spot", reason: notice.Detail})
 		},
@@ -595,12 +649,16 @@ type shutdownReporter struct {
 	logger   *slog.Logger
 	session  ControlPlaneSession
 	taskID   string
+	state    *LocalState
 	onNotice func(workerShutdown.Notice)
 }
 
 func (r *shutdownReporter) ReportNotice(ctx context.Context, notice workerShutdown.Notice) error {
 	if r == nil || r.session == nil {
 		return errors.New("shutdown reporter session is required")
+	}
+	if r.state != nil {
+		r.state.RecordShutdownNotice(notice)
 	}
 	signal := &workerv1.Signal{
 		TaskId:     r.taskID,

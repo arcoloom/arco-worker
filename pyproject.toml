@@ -1,0 +1,15 @@
+[project]
+name = "arco-worker-publish"
+version = "0.1.0"
+description = "Python dependencies for publishing arco-worker artifacts."
+requires-python = ">=3.14,<3.15"
+dependencies = [
+  "boto3>=1.40.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false

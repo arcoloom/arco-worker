@@ -5,14 +5,20 @@ import hashlib
 import json
 import mimetypes
 import os
-import subprocess
 import tempfile
 from pathlib import Path
+
+try:
+    import boto3
+    from botocore.config import Config
+except ImportError as exc:  # pragma: no cover - surfaced as a CLI error
+    raise SystemExit("boto3 is required to publish registry artifacts. Install it with `pip install boto3`.") from exc
 
 
 DEFAULT_BUCKET = "arco-registry"
 DEFAULT_BASE_URL = "https://registry.arcoloom.com"
 DEFAULT_CHANNELS = ("latest", "stable")
+DEFAULT_S3_REGION = "auto"
 ARTIFACT_KIND = "worker"
 ARTIFACT_NAME = "arco-worker"
 ARTIFACT_OS = "linux"
@@ -20,6 +26,14 @@ ARTIFACT_FILES = {
     "amd64": "arco-worker-linux-amd64",
     "arm64": "arco-worker-linux-arm64",
 }
+
+
+def first_env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,8 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bucket",
-        default=os.environ.get("ARCO_REGISTRY_BUCKET", DEFAULT_BUCKET),
-        help="Registry R2 bucket name.",
+        default=first_env("S3_BUCKET") or DEFAULT_BUCKET,
+        help="S3 bucket name.",
     )
     parser.add_argument(
         "--base-url",
@@ -50,6 +64,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Channel name to update. Can be provided multiple times.",
     )
+    parser.add_argument(
+        "--endpoint-url",
+        help="S3-compatible endpoint URL. Defaults to S3_ENDPOINT.",
+    )
+    parser.add_argument(
+        "--region",
+        default=first_env("S3_REGION") or DEFAULT_S3_REGION,
+        help="S3 region name.",
+    )
     return parser
 
 
@@ -61,19 +84,40 @@ def sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def upload_object(bucket: str, key: str, source: Path) -> None:
-    subprocess.run(
-        [
-            "npx",
-            "wrangler@4",
-            "r2",
-            "object",
-            "put",
-            f"{bucket}/{key}",
-            "--file",
-            str(source),
-        ],
-        check=True,
+def resolve_endpoint_url(explicit: str | None) -> str:
+    endpoint_url = explicit or first_env("S3_ENDPOINT")
+    if endpoint_url and endpoint_url.strip():
+        return endpoint_url.rstrip("/")
+
+    raise SystemExit(
+        "S3 endpoint not configured. Pass --endpoint-url or set "
+        "S3_ENDPOINT."
+    )
+
+
+def create_s3_client(endpoint_url: str, region: str):
+    access_key_id = first_env("S3_ACCESS_KEY_ID")
+    secret_access_key = first_env("S3_SECRET_ACCESS_KEY")
+    session_token = first_env("S3_SESSION_TOKEN")
+
+    client_kwargs = {
+        "endpoint_url": endpoint_url,
+        "region_name": region,
+        "config": Config(
+            retries={"max_attempts": 10, "mode": "standard"},
+            s3={"addressing_style": "path"},
+        ),
+    }
+    if access_key_id:
+        client_kwargs["aws_access_key_id"] = access_key_id
+    if secret_access_key:
+        client_kwargs["aws_secret_access_key"] = secret_access_key
+    if session_token:
+        client_kwargs["aws_session_token"] = session_token
+
+    return boto3.client(
+        "s3",
+        **client_kwargs,
     )
 
 
@@ -90,6 +134,17 @@ def content_type_for(path: Path) -> str:
     return guessed or "application/octet-stream"
 
 
+def upload_object(client, bucket: str, key: str, source: Path) -> None:
+    client.upload_file(
+        str(source),
+        bucket,
+        key,
+        ExtraArgs={
+            "ContentType": content_type_for(source),
+        },
+    )
+
+
 def main() -> None:
     args = build_parser().parse_args()
     version = args.version.strip()
@@ -99,6 +154,8 @@ def main() -> None:
     base_url = args.base_url.rstrip("/")
     channels = tuple(dict.fromkeys(args.channels or DEFAULT_CHANNELS))
     dist_dir: Path = args.dist_dir
+    endpoint_url = resolve_endpoint_url(args.endpoint_url)
+    s3_client = create_s3_client(endpoint_url, args.region)
 
     descriptors: dict[str, dict[str, object]] = {}
     for arch, filename in ARTIFACT_FILES.items():
@@ -106,7 +163,7 @@ def main() -> None:
         if not path.is_file():
             raise SystemExit(f"artifact file not found: {path}")
         key = f"artifacts/{ARTIFACT_KIND}/{ARTIFACT_NAME}/{version}/{ARTIFACT_OS}/{arch}/{filename}"
-        upload_object(args.bucket, key, path)
+        upload_object(s3_client, args.bucket, key, path)
         descriptors[arch] = {
             "key": key,
             "filename": filename,
@@ -133,6 +190,7 @@ def main() -> None:
         version_manifest_path = write_json_temp(version_manifest)
         try:
             upload_object(
+                s3_client,
                 args.bucket,
                 f"manifests/versions/artifacts/{ARTIFACT_KIND}/{ARTIFACT_NAME}/{version}/{ARTIFACT_OS}/{arch}.json",
                 version_manifest_path,
@@ -163,6 +221,7 @@ def main() -> None:
             channel_manifest_path = write_json_temp(channel_manifest)
             try:
                 upload_object(
+                    s3_client,
                     args.bucket,
                     f"manifests/channels/artifacts/{ARTIFACT_KIND}/{ARTIFACT_NAME}/{channel}/{ARTIFACT_OS}/{arch}.json",
                     channel_manifest_path,

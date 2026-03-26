@@ -10,6 +10,9 @@ type Engine interface {
 	// Start launches the workload asynchronously and should return once the process is created.
 	Start(ctx context.Context, payload []byte) error
 
+	// Interrupt requests a Ctrl-C style graceful interruption of the running workload.
+	Interrupt(ctx context.Context) error
+
 	// Stop attempts a graceful shutdown of the running workload.
 	Stop(ctx context.Context) error
 

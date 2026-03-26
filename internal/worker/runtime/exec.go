@@ -166,8 +166,17 @@ func (e *ExecEngine) Start(ctx context.Context, payload []byte) error {
 	return nil
 }
 
+// Interrupt sends SIGINT to the workload process group.
+func (e *ExecEngine) Interrupt(ctx context.Context) error {
+	return e.signalProcessGroup(ctx, syscall.SIGINT, "SIGINT")
+}
+
 // Stop sends SIGTERM to the workload process group.
 func (e *ExecEngine) Stop(ctx context.Context) error {
+	return e.signalProcessGroup(ctx, syscall.SIGTERM, "SIGTERM")
+}
+
+func (e *ExecEngine) signalProcessGroup(ctx context.Context, signal syscall.Signal, signalName string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -185,14 +194,14 @@ func (e *ExecEngine) Stop(ctx context.Context) error {
 	}
 
 	pid := cmd.Process.Pid
-	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
+	if err := syscall.Kill(-pid, signal); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
-		return fmt.Errorf("send SIGTERM to process group %d: %w", pid, err)
+		return fmt.Errorf("send %s to process group %d: %w", signalName, pid, err)
 	}
 
-	e.logger.InfoContext(ctx, "exec workload stopping", slog.Int("pid", pid), slog.String("signal", "SIGTERM"))
+	e.logger.InfoContext(ctx, "exec workload stopping", slog.Int("pid", pid), slog.String("signal", signalName))
 
 	return nil
 }

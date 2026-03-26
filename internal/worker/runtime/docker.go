@@ -145,6 +145,14 @@ func (e *DockerEngine) Start(ctx context.Context, payload []byte) error {
 }
 
 func (e *DockerEngine) Stop(ctx context.Context) error {
+	return e.signalContainer(ctx, "SIGTERM")
+}
+
+func (e *DockerEngine) Interrupt(ctx context.Context) error {
+	return e.signalContainer(ctx, "SIGINT")
+}
+
+func (e *DockerEngine) signalContainer(ctx context.Context, signal string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -161,7 +169,19 @@ func (e *DockerEngine) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	command := exec.CommandContext(ctx, "docker", "stop", "--time", strconv.Itoa(dockerStopTimeoutSeconds), containerName)
+	var (
+		commandName string
+		args        []string
+	)
+	switch signal {
+	case "SIGINT":
+		commandName = "docker"
+		args = []string{"kill", "--signal=SIGINT", containerName}
+	default:
+		commandName = "docker"
+		args = []string{"stop", "--time", strconv.Itoa(dockerStopTimeoutSeconds), containerName}
+	}
+	command := exec.CommandContext(ctx, commandName, args...)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		trimmed := strings.TrimSpace(string(output))
@@ -169,12 +189,12 @@ func (e *DockerEngine) Stop(ctx context.Context) error {
 			return nil
 		}
 		if trimmed != "" {
-			return fmt.Errorf("docker stop %q: %w: %s", containerName, err, trimmed)
+			return fmt.Errorf("docker %s %q: %w: %s", strings.ToLower(signal), containerName, err, trimmed)
 		}
-		return fmt.Errorf("docker stop %q: %w", containerName, err)
+		return fmt.Errorf("docker %s %q: %w", strings.ToLower(signal), containerName, err)
 	}
 
-	e.logger.InfoContext(ctx, "docker workload stopping", slog.String("container_name", containerName), slog.String("signal", "SIGTERM"))
+	e.logger.InfoContext(ctx, "docker workload stopping", slog.String("container_name", containerName), slog.String("signal", signal))
 
 	return nil
 }

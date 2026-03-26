@@ -82,8 +82,26 @@ type fakeEngine struct{}
 
 func (fakeEngine) Prepare(context.Context, []byte) error { return nil }
 func (fakeEngine) Start(context.Context, []byte) error   { return nil }
+func (fakeEngine) Interrupt(context.Context) error       { return nil }
 func (fakeEngine) Stop(context.Context) error            { return nil }
 func (fakeEngine) Wait(context.Context) error            { return nil }
+
+type blockingEngine struct {
+	waitCh chan struct{}
+}
+
+func (e blockingEngine) Prepare(context.Context, []byte) error { return nil }
+func (e blockingEngine) Start(context.Context, []byte) error   { return nil }
+func (e blockingEngine) Interrupt(context.Context) error       { return nil }
+func (e blockingEngine) Stop(context.Context) error            { return nil }
+func (e blockingEngine) Wait(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.waitCh:
+		return nil
+	}
+}
 
 type fakeShutdownMonitor struct {
 	run func(context.Context) error
@@ -220,6 +238,7 @@ func TestRunnerExitsCleanlyOnPreAssignmentShutdown(t *testing.T) {
 }
 
 func TestRunnerStartsShutdownMonitorWhenEnabled(t *testing.T) {
+	engineDone := make(chan struct{})
 	session := &scriptedSession{
 		messages: []*workerv1.ControlToWorker{
 			{
@@ -252,7 +271,9 @@ func TestRunnerStartsShutdownMonitorWhenEnabled(t *testing.T) {
 	runner, err := NewRunner(
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		client,
-		func(context.Context, workerv1.RuntimeKind) (workerRuntime.Engine, error) { return fakeEngine{}, nil },
+		func(context.Context, workerv1.RuntimeKind) (workerRuntime.Engine, error) {
+			return blockingEngine{waitCh: engineDone}, nil
+		},
 		RunnerConfig{
 			InstanceID:        "instance-1",
 			Provider:          "aws",
@@ -263,11 +284,13 @@ func TestRunnerStartsShutdownMonitorWhenEnabled(t *testing.T) {
 			ShutdownMonitor: func(_ *slog.Logger, reporter workerShutdown.Reporter, _ workerShutdown.MonitorConfig) ShutdownMonitor {
 				return fakeShutdownMonitor{
 					run: func(ctx context.Context) error {
-						return reporter.ReportNotice(ctx, workerShutdown.Notice{
+						err := reporter.ReportNotice(ctx, workerShutdown.Notice{
 							Provider:   "aws",
 							Detail:     "aws spot interruption notice: action=terminate",
 							ShutdownAt: time.Date(2026, 3, 26, 10, 0, 0, 0, time.UTC),
 						})
+						close(engineDone)
+						return err
 					},
 				}
 			},

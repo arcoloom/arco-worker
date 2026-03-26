@@ -2,11 +2,12 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"sync/atomic"
+	"strings"
 	"time"
 
 	workerv1 "github.com/arcoloom/arco-proto/gen/go/arcoloom/worker/v1"
@@ -44,6 +45,11 @@ type Runner struct {
 }
 
 type controlPlaneShutdownError struct {
+	reason string
+}
+
+type shutdownRequest struct {
+	source string
 	reason string
 }
 
@@ -261,9 +267,11 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 	}
 
 	payload := []byte(assignment.GetPayload())
+	gracePeriod := assignmentShutdownGracePeriod(payload)
+	shutdownRequests := make(chan shutdownRequest, 4)
 	monitorCtx, stopMonitor := context.WithCancel(ctx)
 	defer stopMonitor()
-	r.startShutdownMonitor(monitorCtx, session, taskID, payload)
+	r.startShutdownMonitor(monitorCtx, session, taskID, payload, shutdownRequests)
 	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_PREPARING, "preparing workload"); err != nil {
 		return err
 	}
@@ -292,42 +300,85 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 		return err
 	}
 
-	var interrupted atomic.Bool
+	controlLoopCtx, stopControlLoop := context.WithCancel(ctx)
+	defer stopControlLoop()
+	go r.listenForControlPlaneShutdown(controlLoopCtx, session, shutdownRequests)
+
+	waitCh := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		interrupted.Store(true)
-		stopCtx, cancel := context.WithTimeout(context.Background(), r.config.StopTimeout)
-		defer cancel()
-		if stopErr := engine.Stop(stopCtx); stopErr != nil {
-			r.logger.ErrorContext(stopCtx, "failed to stop workload", slog.String("task_id", taskID), slog.String("error", stopErr.Error()))
+		waitCh <- engine.Wait(context.WithoutCancel(ctx))
+	}()
+
+	var (
+		shutdownTriggered bool
+		shutdownReason    string
+		shutdownSource    string
+		graceTimer        *time.Timer
+		graceTimerCh      <-chan time.Time
+		ctxDoneCh         <-chan struct{} = ctx.Done()
+	)
+	defer func() {
+		if graceTimer != nil {
+			graceTimer.Stop()
 		}
 	}()
 
-	waitErr := engine.Wait(context.WithoutCancel(ctx))
-	if waitErr == nil && interrupted.Load() && ctx.Err() != nil {
-		waitErr = ctx.Err()
-	}
-	if waitErr != nil {
-		r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, waitErr.Error())
-		r.logger.ErrorContext(
-			context.WithoutCancel(ctx),
-			"workload finished with failure",
-			slog.String("task_id", taskID),
-			slog.String("error", waitErr.Error()),
-		)
-		return nil
-	}
-	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_SUCCESS, "workload finished successfully"); err != nil {
-		return err
-	}
+	for {
+		select {
+		case request := <-shutdownRequests:
+			if shutdownTriggered {
+				continue
+			}
+			shutdownTriggered = true
+			shutdownReason = nonEmptyString(request.reason, "shutdown requested")
+			shutdownSource = request.source
+			if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_STOPPING, stoppingMessage(shutdownSource, shutdownReason, gracePeriod)); err != nil {
+				return err
+			}
+			r.interruptWorkload(context.Background(), taskID, engine)
+			graceTimer = time.NewTimer(gracePeriod)
+			graceTimerCh = graceTimer.C
+		case <-graceTimerCh:
+			graceTimerCh = nil
+			r.logger.WarnContext(
+				context.WithoutCancel(ctx),
+				"graceful shutdown timed out; forcing workload stop",
+				slog.String("task_id", taskID),
+				slog.String("reason", shutdownReason),
+				slog.Duration("grace_period", gracePeriod),
+			)
+			r.stopWorkload(context.Background(), taskID, engine)
+		case <-ctxDoneCh:
+			ctxDoneCh = nil
+			r.stopWorkload(context.Background(), taskID, engine)
+		case waitErr := <-waitCh:
+			stopControlLoop()
+			if shutdownTriggered {
+				return r.reportInterruptedExit(ctx, session, taskID, shutdownSource, shutdownReason, waitErr)
+			}
+			if waitErr != nil {
+				r.logStatusError(ctx, session, taskID, workerv1.TaskState_TASK_STATE_FAILED, waitErr.Error())
+				r.logger.ErrorContext(
+					context.WithoutCancel(ctx),
+					"workload finished with failure",
+					slog.String("task_id", taskID),
+					slog.String("error", waitErr.Error()),
+				)
+				return nil
+			}
+			if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_SUCCESS, "workload finished successfully"); err != nil {
+				return err
+			}
 
-	r.logger.InfoContext(
-		context.WithoutCancel(ctx),
-		"worker completed task",
-		slog.String("task_id", taskID),
-		slog.String("runtime_kind", assignment.GetRuntimeKind().String()),
-	)
-	return nil
+			r.logger.InfoContext(
+				context.WithoutCancel(ctx),
+				"worker completed task",
+				slog.String("task_id", taskID),
+				slog.String("runtime_kind", assignment.GetRuntimeKind().String()),
+			)
+			return nil
+		}
+	}
 }
 
 func (r *Runner) waitForControlPlaneClosure(ctx context.Context, session ControlPlaneSession) error {
@@ -442,7 +493,21 @@ func (r *Runner) stopWorkload(ctx context.Context, taskID string, engine workerR
 	}
 }
 
-func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneSession, taskID string, payload []byte) {
+func (r *Runner) interruptWorkload(ctx context.Context, taskID string, engine workerRuntime.Engine) {
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.config.StopTimeout)
+	defer cancel()
+
+	if err := engine.Interrupt(stopCtx); err != nil {
+		r.logger.ErrorContext(
+			stopCtx,
+			"failed to interrupt workload",
+			slog.String("task_id", taskID),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneSession, taskID string, payload []byte, requests chan<- shutdownRequest) {
 	if r.monitorFactory == nil {
 		return
 	}
@@ -454,6 +519,9 @@ func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneS
 		logger:  r.logger,
 		session: session,
 		taskID:  taskID,
+		onNotice: func(notice workerShutdown.Notice) {
+			enqueueShutdownRequest(requests, shutdownRequest{source: "spot", reason: notice.Detail})
+		},
 	}, config)
 	if monitor == nil {
 		return
@@ -479,10 +547,55 @@ func nonNilShutdownMonitorFactory(factory ShutdownMonitorFactory) ShutdownMonito
 	}
 }
 
+func (r *Runner) listenForControlPlaneShutdown(ctx context.Context, session ControlPlaneSession, requests chan<- shutdownRequest) {
+	for {
+		message, err := session.Receive(ctx)
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return
+			}
+			r.logger.WarnContext(context.WithoutCancel(ctx), "control-plane receive loop exited", slog.String("error", err.Error()))
+			return
+		}
+
+		switch payload := message.GetMessage().(type) {
+		case *workerv1.ControlToWorker_Shutdown:
+			reason := payload.Shutdown.GetReason()
+			if reason == "" {
+				reason = "control plane requested shutdown"
+			}
+			enqueueShutdownRequest(requests, shutdownRequest{source: "control-plane", reason: reason})
+		case *workerv1.ControlToWorker_HelloAck, *workerv1.ControlToWorker_Assignment:
+			r.logger.WarnContext(
+				context.WithoutCancel(ctx),
+				"received unexpected control-plane message while task is running",
+				slog.String("message_type", fmt.Sprintf("%T", payload)),
+			)
+		default:
+			r.logger.WarnContext(
+				context.WithoutCancel(ctx),
+				"received unsupported control-plane message while task is running",
+				slog.String("message_type", fmt.Sprintf("%T", payload)),
+			)
+		}
+	}
+}
+
+func enqueueShutdownRequest(ch chan<- shutdownRequest, request shutdownRequest) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- request:
+	default:
+	}
+}
+
 type shutdownReporter struct {
-	logger  *slog.Logger
-	session ControlPlaneSession
-	taskID  string
+	logger   *slog.Logger
+	session  ControlPlaneSession
+	taskID   string
+	onNotice func(workerShutdown.Notice)
 }
 
 func (r *shutdownReporter) ReportNotice(ctx context.Context, notice workerShutdown.Notice) error {
@@ -511,5 +624,68 @@ func (r *shutdownReporter) ReportNotice(ctx context.Context, notice workerShutdo
 			slog.String("detail", notice.Detail),
 		)
 	}
+	if r.onNotice != nil {
+		r.onNotice(notice)
+	}
 	return nil
+}
+
+func (r *Runner) reportInterruptedExit(ctx context.Context, session ControlPlaneSession, taskID string, source string, reason string, waitErr error) error {
+	message := interruptedMessage(source, reason, waitErr)
+	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_INTERRUPTED, message); err != nil {
+		return err
+	}
+	if waitErr != nil {
+		r.logger.WarnContext(
+			context.WithoutCancel(ctx),
+			"workload exited after shutdown request with error",
+			slog.String("task_id", taskID),
+			slog.String("error", waitErr.Error()),
+		)
+	} else {
+		r.logger.InfoContext(
+			context.WithoutCancel(ctx),
+			"workload exited after shutdown request",
+			slog.String("task_id", taskID),
+			slog.String("source", source),
+		)
+	}
+	return nil
+}
+
+func assignmentShutdownGracePeriod(payload []byte) time.Duration {
+	const fallback = 5 * time.Minute
+	var envelope struct {
+		ShutdownPolicy *struct {
+			GracePeriod string `json:"grace_period"`
+		} `json:"shutdown_policy"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &envelope) != nil || envelope.ShutdownPolicy == nil {
+		return fallback
+	}
+	if value, err := time.ParseDuration(envelope.ShutdownPolicy.GracePeriod); err == nil && value > 0 {
+		return value
+	}
+	return fallback
+}
+
+func stoppingMessage(source string, reason string, gracePeriod time.Duration) string {
+	return fmt.Sprintf("%s shutdown requested; sending Ctrl-C to workload and waiting up to %s: %s", nonEmptyString(source, "worker"), gracePeriod, nonEmptyString(reason, "shutdown requested"))
+}
+
+func interruptedMessage(source string, reason string, waitErr error) string {
+	prefix := fmt.Sprintf("%s shutdown completed", nonEmptyString(source, "worker"))
+	if waitErr == nil {
+		return fmt.Sprintf("%s after Ctrl-C: %s", prefix, nonEmptyString(reason, "shutdown requested"))
+	}
+	return fmt.Sprintf("%s after Ctrl-C with exit detail %q: %s", prefix, waitErr.Error(), nonEmptyString(reason, "shutdown requested"))
+}
+
+func nonEmptyString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }

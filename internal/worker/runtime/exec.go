@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"archive/zip"
 	"bufio"
 	"context"
 	"encoding/json"
@@ -8,22 +9,23 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	goRuntime "runtime"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
-const storageDriverS3FS = "s3fs"
-
-type storageToolInstallStrategy struct {
-	name        string
-	command     string
-	prepareArgs [][]string
-	installArgs [][]string
-}
+const (
+	storageDriverRclone = "rclone"
+	storageMountTool    = "rclone"
+	rcloneDaemonWait    = "30s"
+	rcloneVFSCacheMode  = "writes"
+)
 
 // ExecEngine runs workloads as plain host processes.
 type ExecEngine struct {
@@ -39,8 +41,8 @@ type ExecEngine struct {
 }
 
 type mountedStorage struct {
-	mountPath  string
-	passwdFile string
+	mountPath string
+	cacheDir  string
 }
 
 type storageMountProbeResult struct {
@@ -63,6 +65,8 @@ var _ Engine = (*ExecEngine)(nil)
 var _ LogEmitterAware = (*ExecEngine)(nil)
 
 var inspectMountedStorage = defaultInspectMountedStorage
+var rcloneDownloadBaseURL = "https://downloads.rclone.org"
+var storageToolInstallRootOverride string
 
 // NewExecEngine constructs an Engine backed by os/exec.
 func NewExecEngine(logger *slog.Logger) *ExecEngine {
@@ -374,9 +378,9 @@ func validateStorageMounts(mounts []StorageMount) error {
 	for index, mount := range mounts {
 		driver := strings.TrimSpace(mount.Driver)
 		if driver == "" {
-			driver = storageDriverS3FS
+			driver = storageDriverRclone
 		}
-		if !strings.EqualFold(driver, storageDriverS3FS) {
+		if !strings.EqualFold(driver, storageDriverRclone) {
 			return fmt.Errorf("mount %d uses unsupported storage driver %q", index+1, mount.Driver)
 		}
 
@@ -405,20 +409,6 @@ func validateStorageMounts(mounts []StorageMount) error {
 		}
 		seenPaths[mountPath] = struct{}{}
 
-		for _, option := range mount.ExtraOptions {
-			trimmed := strings.TrimSpace(option)
-			if trimmed == "" {
-				return fmt.Errorf("mount %d extra_options contains an empty entry", index+1)
-			}
-			lower := strings.ToLower(trimmed)
-			switch {
-			case lower == "use_path_request_style",
-				strings.HasPrefix(lower, "url="),
-				strings.HasPrefix(lower, "endpoint="),
-				strings.HasPrefix(lower, "passwd_file="):
-				return fmt.Errorf("mount %d extra option %q conflicts with managed s3fs options", index+1, trimmed)
-			}
-		}
 	}
 
 	return nil
@@ -429,7 +419,7 @@ func checkStorageTools(ctx context.Context, logger *slog.Logger, mounts []Storag
 		return nil
 	}
 
-	if err := ensureS3FSAvailable(ctx, logger); err != nil {
+	if _, err := ensureRcloneAvailable(ctx, logger); err != nil {
 		return err
 	}
 	if _, _, err := unmountCommand(); err != nil {
@@ -438,197 +428,196 @@ func checkStorageTools(ctx context.Context, logger *slog.Logger, mounts []Storag
 	return nil
 }
 
-func ensureS3FSAvailable(ctx context.Context, logger *slog.Logger) error {
+func ensureRcloneAvailable(ctx context.Context, logger *slog.Logger) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
 
-	_, pathErr := exec.LookPath(storageDriverS3FS)
+	path, pathErr := exec.LookPath(storageMountTool)
 	if pathErr == nil {
-		return nil
+		return path, nil
 	}
 
-	if installErr := installS3FS(ctx, logger); installErr != nil {
-		return fmt.Errorf("look up %q: %w; automatic install failed: %w", storageDriverS3FS, pathErr, installErr)
+	installedPath, installErr := installRclone(ctx, logger)
+	if installErr != nil {
+		return "", fmt.Errorf("look up %q: %w; automatic download failed: %w", storageMountTool, pathErr, installErr)
 	}
 
-	if _, err := exec.LookPath(storageDriverS3FS); err != nil {
-		return fmt.Errorf("look up %q after automatic install: %w", storageDriverS3FS, err)
+	if _, err := os.Stat(installedPath); err != nil {
+		return "", fmt.Errorf("look up %q after automatic download: %w", storageMountTool, err)
 	}
 
-	return nil
+	return installedPath, nil
 }
 
-func installS3FS(ctx context.Context, logger *slog.Logger) error {
+func installRclone(ctx context.Context, logger *slog.Logger) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
 
-	strategies := []storageToolInstallStrategy{
-		{
-			name:        "apt-get",
-			command:     "apt-get",
-			prepareArgs: [][]string{{"update"}},
-			installArgs: [][]string{{"install", "-y", "s3fs"}},
-		},
-		{
-			name:        "dnf",
-			command:     "dnf",
-			installArgs: [][]string{{"install", "-y", "s3fs-fuse"}, {"install", "-y", "s3fs"}},
-		},
-		{
-			name:        "microdnf",
-			command:     "microdnf",
-			installArgs: [][]string{{"install", "-y", "s3fs-fuse"}, {"install", "-y", "s3fs"}},
-		},
-		{
-			name:        "yum",
-			command:     "yum",
-			installArgs: [][]string{{"install", "-y", "s3fs-fuse"}, {"install", "-y", "s3fs"}},
-		},
-		{
-			name:        "apk",
-			command:     "apk",
-			installArgs: [][]string{{"add", "--no-cache", "s3fs-fuse"}, {"add", "--no-cache", "s3fs"}},
-		},
-		{
-			name:        "pacman",
-			command:     "pacman",
-			installArgs: [][]string{{"-Sy", "--noconfirm", "s3fs-fuse"}, {"-Sy", "--noconfirm", "s3fs"}},
-		},
-		{
-			name:        "zypper",
-			command:     "zypper",
-			installArgs: [][]string{{"--non-interactive", "install", "-y", "s3fs"}, {"--non-interactive", "install", "-y", "s3fs-fuse"}},
-		},
-		{
-			name:        "brew",
-			command:     "brew",
-			installArgs: [][]string{{"install", "s3fs"}},
-		},
-	}
-
-	var attemptErrors []string
-	supportedManagers := make([]string, 0, len(strategies))
-	for _, strategy := range strategies {
-		supportedManagers = append(supportedManagers, strategy.name)
-		if _, err := exec.LookPath(strategy.command); err != nil {
-			continue
-		}
-
-		if logger != nil {
-			logger.InfoContext(ctx, "attempting automatic s3fs install", slog.String("package_manager", strategy.name))
-		}
-
-		if err := runStorageInstallStrategy(ctx, strategy); err != nil {
-			attemptErrors = append(attemptErrors, fmt.Sprintf("%s: %s", strategy.name, err.Error()))
-			if logger != nil {
-				logger.WarnContext(
-					ctx,
-					"automatic s3fs install attempt failed",
-					slog.String("package_manager", strategy.name),
-					slog.String("error", err.Error()),
-				)
-			}
-			continue
-		}
-
-		if logger != nil {
-			logger.InfoContext(ctx, "installed s3fs automatically", slog.String("package_manager", strategy.name))
-		}
-		return nil
-	}
-
-	if len(attemptErrors) == 0 {
-		return fmt.Errorf(
-			"no supported package manager found to install %q (tried %s)",
-			storageDriverS3FS,
-			strings.Join(supportedManagers, ", "),
-		)
-	}
-
-	return errors.New(strings.Join(attemptErrors, "; "))
-}
-
-func runStorageInstallStrategy(ctx context.Context, strategy storageToolInstallStrategy) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	prefixes := [][]string{{}}
-	if os.Geteuid() != 0 {
-		if _, err := exec.LookPath("sudo"); err == nil {
-			prefixes = append(prefixes, []string{"sudo", "-n"})
-		}
-	}
-
-	var attemptErrors []string
-	for _, prefix := range prefixes {
-		if err := runStorageInstallCommands(ctx, strategy.command, strategy.prepareArgs, prefix); err != nil {
-			attemptErrors = append(attemptErrors, err.Error())
-			continue
-		}
-
-		var installErrors []string
-		for _, args := range strategy.installArgs {
-			if err := runStorageInstallCommand(ctx, strategy.command, args, prefix); err != nil {
-				installErrors = append(installErrors, err.Error())
-				continue
-			}
-			return nil
-		}
-		if len(installErrors) > 0 {
-			attemptErrors = append(attemptErrors, strings.Join(installErrors, "; "))
-		}
-	}
-
-	if len(attemptErrors) == 0 {
-		return fmt.Errorf("no install commands configured for %s", strategy.name)
-	}
-
-	return errors.New(strings.Join(attemptErrors, "; "))
-}
-
-func runStorageInstallCommands(ctx context.Context, command string, commands [][]string, prefix []string) error {
-	for _, args := range commands {
-		if len(args) == 0 {
-			continue
-		}
-		if err := runStorageInstallCommand(ctx, command, args, prefix); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func runStorageInstallCommand(ctx context.Context, command string, args []string, prefix []string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	runCommand := command
-	runArgs := append([]string(nil), args...)
-	displayParts := append([]string(nil), prefix...)
-	displayParts = append(displayParts, command)
-	displayParts = append(displayParts, args...)
-
-	if len(prefix) > 0 {
-		runCommand = prefix[0]
-		runArgs = append(append([]string(nil), prefix[1:]...), command)
-		runArgs = append(runArgs, args...)
-	}
-
-	cmd := exec.CommandContext(ctx, runCommand, runArgs...)
-	cmd.Env = mergeEnv(os.Environ(), map[string]string{
-		"DEBIAN_FRONTEND": "noninteractive",
-	})
-	output, err := cmd.CombinedOutput()
+	installRoot, err := storageToolInstallRoot()
 	if err != nil {
-		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
-			return fmt.Errorf("%s: %w: %s", strings.Join(displayParts, " "), err, trimmed)
-		}
-		return fmt.Errorf("%s: %w", strings.Join(displayParts, " "), err)
+		return "", err
 	}
+	targetPath := filepath.Join(installRoot, storageMountTool)
+	if info, statErr := os.Stat(targetPath); statErr == nil && info.Mode().IsRegular() {
+		return targetPath, nil
+	}
+
+	if err := os.MkdirAll(installRoot, 0o755); err != nil {
+		return "", fmt.Errorf("create rclone install root %q: %w", installRoot, err)
+	}
+
+	archiveURL, err := rcloneArchiveURL()
+	if err != nil {
+		return "", err
+	}
+	if logger != nil {
+		logger.InfoContext(ctx, "downloading rclone automatically", slog.String("url", archiveURL))
+	}
+
+	archivePath, err := downloadRcloneArchive(ctx, archiveURL)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = os.Remove(archivePath)
+	}()
+
+	if err := extractRcloneBinary(archivePath, targetPath); err != nil {
+		return "", err
+	}
+
+	if logger != nil {
+		logger.InfoContext(ctx, "downloaded rclone automatically", slog.String("path", targetPath))
+	}
+	return targetPath, nil
+}
+
+func storageToolInstallRoot() (string, error) {
+	if storageToolInstallRootOverride != "" {
+		return storageToolInstallRootOverride, nil
+	}
+
+	if dir, err := os.UserCacheDir(); err == nil && strings.TrimSpace(dir) != "" {
+		return filepath.Join(dir, "arco", "tools", storageMountTool), nil
+	}
+
+	return filepath.Join(os.TempDir(), "arco-tools", storageMountTool), nil
+}
+
+func rcloneArchiveURL() (string, error) {
+	if goRuntime.GOOS != "linux" {
+		return "", fmt.Errorf("%s auto-download is only supported on linux", storageMountTool)
+	}
+
+	arch := ""
+	switch goRuntime.GOARCH {
+	case "amd64":
+		arch = "amd64"
+	case "arm64":
+		arch = "arm64"
+	default:
+		return "", fmt.Errorf("%s auto-download is not supported on architecture %q", storageMountTool, goRuntime.GOARCH)
+	}
+
+	return fmt.Sprintf("%s/rclone-current-linux-%s.zip", rcloneDownloadBaseURL, arch), nil
+}
+
+func downloadRcloneArchive(ctx context.Context, archiveURL string) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, archiveURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build rclone download request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("download rclone archive from %s: %w", archiveURL, err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		if trimmed := strings.TrimSpace(string(body)); trimmed != "" {
+			return "", fmt.Errorf("download rclone archive from %s: unexpected status %s: %s", archiveURL, response.Status, trimmed)
+		}
+		return "", fmt.Errorf("download rclone archive from %s: unexpected status %s", archiveURL, response.Status)
+	}
+
+	file, err := os.CreateTemp("", "arco-rclone-*.zip")
+	if err != nil {
+		return "", fmt.Errorf("create temporary rclone archive: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := io.Copy(file, response.Body); err != nil {
+		_ = os.Remove(file.Name())
+		return "", fmt.Errorf("write temporary rclone archive %q: %w", file.Name(), err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(file.Name())
+		return "", fmt.Errorf("close temporary rclone archive %q: %w", file.Name(), err)
+	}
+
+	return file.Name(), nil
+}
+
+func extractRcloneBinary(archivePath string, targetPath string) error {
+	reader, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return fmt.Errorf("open rclone archive %q: %w", archivePath, err)
+	}
+	defer reader.Close()
+
+	temporaryFile, err := os.CreateTemp(filepath.Dir(targetPath), "rclone-*")
+	if err != nil {
+		return fmt.Errorf("create temporary rclone binary in %q: %w", filepath.Dir(targetPath), err)
+	}
+	temporaryPath := temporaryFile.Name()
+	success := false
+	defer func() {
+		if !success {
+			temporaryFile.Close()
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+
+	foundBinary := false
+	for _, file := range reader.File {
+		if file.FileInfo().IsDir() || filepath.Base(file.Name) != storageMountTool {
+			continue
+		}
+
+		openedFile, err := file.Open()
+		if err != nil {
+			return fmt.Errorf("open %q from rclone archive %q: %w", file.Name, archivePath, err)
+		}
+		_, copyErr := io.Copy(temporaryFile, openedFile)
+		closeErr := openedFile.Close()
+		if copyErr != nil {
+			return fmt.Errorf("extract %q from rclone archive %q: %w", file.Name, archivePath, copyErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close %q from rclone archive %q: %w", file.Name, archivePath, closeErr)
+		}
+		foundBinary = true
+		break
+	}
+
+	if !foundBinary {
+		return fmt.Errorf("rclone archive %q did not contain %q", archivePath, storageMountTool)
+	}
+	if err := temporaryFile.Chmod(0o755); err != nil {
+		return fmt.Errorf("chmod temporary rclone binary %q: %w", temporaryPath, err)
+	}
+	if err := temporaryFile.Close(); err != nil {
+		return fmt.Errorf("close temporary rclone binary %q: %w", temporaryPath, err)
+	}
+	if err := os.Rename(temporaryPath, targetPath); err != nil {
+		return fmt.Errorf("move temporary rclone binary %q to %q: %w", temporaryPath, targetPath, err)
+	}
+	success = true
 
 	return nil
 }
@@ -660,52 +649,52 @@ func (e *ExecEngine) mountSingleStorage(ctx context.Context, mount StorageMount)
 		return mountedStorage{}, err
 	}
 
+	mountBinary, err := ensureRcloneAvailable(ctx, e.logger)
+	if err != nil {
+		return mountedStorage{}, err
+	}
+
 	mountPath := filepath.Clean(strings.TrimSpace(mount.MountPath))
 	if err := os.MkdirAll(mountPath, 0o755); err != nil {
 		return mountedStorage{}, fmt.Errorf("create mount path %q: %w", mountPath, err)
 	}
 
-	passwdFile, err := writeS3FSPasswordFile(mount.AccessKeyID, mount.SecretAccessKey)
+	cacheDir, err := os.MkdirTemp("", "arco-rclone-cache-*")
 	if err != nil {
-		return mountedStorage{}, err
+		return mountedStorage{}, fmt.Errorf("create rclone cache dir: %w", err)
 	}
+	success := false
+	defer func() {
+		if !success {
+			_ = os.RemoveAll(cacheDir)
+		}
+	}()
 
-	bucketArg := strings.TrimSpace(mount.Bucket)
+	remoteSpec := buildRcloneRemoteSpec(mount)
 	prefix := strings.Trim(strings.TrimSpace(mount.Prefix), "/")
-	if prefix != "" {
-		bucketArg = fmt.Sprintf("%s:/%s", bucketArg, prefix)
-	}
-
 	args := []string{
-		bucketArg,
+		"mount",
+		remoteSpec,
 		mountPath,
-		"-o", "passwd_file=" + passwdFile,
-		"-o", "url=" + strings.TrimSpace(mount.Endpoint),
-	}
-	if mount.UsePathStyle {
-		args = append(args, "-o", "use_path_request_style")
-	}
-	if region := strings.TrimSpace(mount.Region); region != "" {
-		args = append(args, "-o", "endpoint="+region)
-	}
-	for _, option := range mount.ExtraOptions {
-		args = append(args, "-o", strings.TrimSpace(option))
+		"--daemon",
+		"--daemon-wait", rcloneDaemonWait,
+		"--cache-dir", cacheDir,
+		"--vfs-cache-mode", rcloneVFSCacheMode,
+		"--log-level", "ERROR",
 	}
 
-	command := exec.CommandContext(ctx, storageDriverS3FS, args...)
-	command.Env = storageCommandEnv(mount)
+	command := exec.CommandContext(ctx, mountBinary, args...)
 	output, err := command.CombinedOutput()
 	if err != nil {
-		_ = os.Remove(passwdFile)
 		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
-			return mountedStorage{}, fmt.Errorf("run s3fs: %w: %s", err, trimmed)
+			return mountedStorage{}, fmt.Errorf("run rclone mount: %w: %s", err, trimmed)
 		}
-		return mountedStorage{}, fmt.Errorf("run s3fs: %w", err)
+		return mountedStorage{}, fmt.Errorf("run rclone mount: %w", err)
 	}
 
 	mountedItem := mountedStorage{
-		mountPath:  mountPath,
-		passwdFile: passwdFile,
+		mountPath: mountPath,
+		cacheDir:  cacheDir,
 	}
 	probe := inspectMountedStorage(mountPath)
 	if err := validateMountedStorage(mount, probe); err != nil {
@@ -733,7 +722,37 @@ func (e *ExecEngine) mountSingleStorage(ctx context.Context, mount StorageMount)
 		slog.Bool("has_prefix", prefix != ""),
 	)
 
+	success = true
 	return mountedItem, nil
+}
+
+func buildRcloneRemoteSpec(mount StorageMount) string {
+	bucketPath := strings.TrimSpace(mount.Bucket)
+	if prefix := strings.Trim(strings.TrimSpace(mount.Prefix), "/"); prefix != "" {
+		bucketPath = bucketPath + "/" + prefix
+	}
+
+	options := []string{
+		quoteRcloneConnectionOption("provider", "Other"),
+		quoteRcloneConnectionOption("access_key_id", strings.TrimSpace(mount.AccessKeyID)),
+		quoteRcloneConnectionOption("secret_access_key", strings.TrimSpace(mount.SecretAccessKey)),
+		quoteRcloneConnectionOption("endpoint", strings.TrimSpace(mount.Endpoint)),
+		"env_auth=false",
+		fmt.Sprintf("force_path_style=%t", mount.UsePathStyle),
+	}
+	if region := strings.TrimSpace(mount.Region); region != "" {
+		options = append(options, quoteRcloneConnectionOption("region", region))
+	}
+	if sessionToken := strings.TrimSpace(mount.SessionToken); sessionToken != "" {
+		options = append(options, quoteRcloneConnectionOption("session_token", sessionToken))
+	}
+
+	return fmt.Sprintf(":s3,%s:%s", strings.Join(options, ","), bucketPath)
+}
+
+func quoteRcloneConnectionOption(key string, value string) string {
+	escaped := strings.ReplaceAll(value, `"`, `""`)
+	return fmt.Sprintf(`%s="%s"`, key, escaped)
 }
 
 func (e *ExecEngine) cleanupStorage(ctx context.Context, mounts []mountedStorage) error {
@@ -751,9 +770,9 @@ func (e *ExecEngine) cleanupStorage(ctx context.Context, mounts []mountedStorage
 				e.logger.InfoContext(ctx, "unmounted s3-compatible storage", slog.String("mount_path", mount.mountPath))
 			}
 		}
-		if mount.passwdFile != "" {
-			if err := os.Remove(mount.passwdFile); err != nil && !errors.Is(err, os.ErrNotExist) {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove passwd file %q: %w", mount.passwdFile, err))
+		if mount.cacheDir != "" {
+			if err := os.RemoveAll(mount.cacheDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove rclone cache dir %q: %w", mount.cacheDir, err))
 			}
 		}
 	}
@@ -776,47 +795,13 @@ func (e *ExecEngine) cleanupMountedStorageAfterProbeFailure(
 		}
 	}
 
-	if mount.passwdFile != "" {
-		if err := os.Remove(mount.passwdFile); err != nil && !errors.Is(err, os.ErrNotExist) {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove passwd file %q: %w", mount.passwdFile, err))
+	if mount.cacheDir != "" {
+		if err := os.RemoveAll(mount.cacheDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove rclone cache dir %q: %w", mount.cacheDir, err))
 		}
 	}
 
 	return cleanupErr
-}
-
-func writeS3FSPasswordFile(accessKeyID string, secretAccessKey string) (string, error) {
-	file, err := os.CreateTemp("", "arco-s3fs-passwd-*")
-	if err != nil {
-		return "", fmt.Errorf("create s3fs passwd file: %w", err)
-	}
-	path := file.Name()
-	if err := file.Chmod(0o600); err != nil {
-		file.Close()
-		_ = os.Remove(path)
-		return "", fmt.Errorf("chmod s3fs passwd file %q: %w", path, err)
-	}
-	if _, err := file.WriteString(strings.TrimSpace(accessKeyID) + ":" + strings.TrimSpace(secretAccessKey)); err != nil {
-		file.Close()
-		_ = os.Remove(path)
-		return "", fmt.Errorf("write s3fs passwd file %q: %w", path, err)
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("close s3fs passwd file %q: %w", path, err)
-	}
-	return path, nil
-}
-
-func storageCommandEnv(mount StorageMount) []string {
-	env := mergeEnv(os.Environ(), map[string]string{
-		"AWS_ACCESS_KEY_ID":     strings.TrimSpace(mount.AccessKeyID),
-		"AWS_SECRET_ACCESS_KEY": strings.TrimSpace(mount.SecretAccessKey),
-	})
-	if token := strings.TrimSpace(mount.SessionToken); token != "" {
-		env = mergeEnv(env, map[string]string{"AWS_SESSION_TOKEN": token})
-	}
-	return env
 }
 
 func validateMountedStorage(mount StorageMount, probe storageMountProbeResult) error {
@@ -827,21 +812,21 @@ func validateMountedStorage(mount StorageMount, probe storageMountProbeResult) e
 	switch {
 	case !probe.PathExists:
 		return fmt.Errorf(
-			"s3fs reported success but mount path %q does not exist (%s); diagnostics: %s",
+			"storage mount command reported success but mount path %q does not exist (%s); diagnostics: %s",
 			mountPath,
 			summary,
 			diagnostics,
 		)
 	case probe.MountInfo == nil && probe.MountInfoError == nil:
 		return fmt.Errorf(
-			"s3fs reported success but mount path %q is not present in /proc/self/mountinfo (%s); diagnostics: %s",
+			"storage mount command reported success but mount path %q is not present in /proc/self/mountinfo (%s); diagnostics: %s",
 			mountPath,
 			summary,
 			diagnostics,
 		)
 	case probe.ProbeError != nil:
 		return fmt.Errorf(
-			"s3fs reported success but mount path %q is not readable (%s): %w; diagnostics: %s",
+			"storage mount command reported success but mount path %q is not readable (%s): %w; diagnostics: %s",
 			mountPath,
 			summary,
 			probe.ProbeError,
@@ -866,25 +851,8 @@ func summarizeMountedStorage(mount StorageMount) string {
 	if region := strings.TrimSpace(mount.Region); region != "" {
 		parts = append(parts, fmt.Sprintf("region=%q", region))
 	}
-	if len(mount.ExtraOptions) > 0 {
-		parts = append(parts, fmt.Sprintf("extra_options=%q", compactMountExtraOptions(mount.ExtraOptions)))
-	}
 
 	return strings.Join(parts, ", ")
-}
-
-func compactMountExtraOptions(options []string) string {
-	if len(options) == 0 {
-		return ""
-	}
-
-	items := make([]string, 0, len(options))
-	for _, option := range options {
-		if trimmed := strings.TrimSpace(option); trimmed != "" {
-			items = append(items, trimmed)
-		}
-	}
-	return strings.Join(items, ",")
 }
 
 func formatStorageMountDiagnostics(probe storageMountProbeResult) string {

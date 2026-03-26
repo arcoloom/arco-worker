@@ -85,6 +85,7 @@ type localTaskSnapshot struct {
 	Image                string               `json:"image,omitempty"`
 	WorkDir              string               `json:"work_dir,omitempty"`
 	WorkspaceRoot        string               `json:"workspace_root,omitempty"`
+	GPUCount             int                  `json:"gpu_count,omitempty"`
 	EnvCount             int                  `json:"env_count,omitempty"`
 	StorageMountCount    int                  `json:"storage_mount_count,omitempty"`
 	ShutdownGracePeriod  string               `json:"shutdown_grace_period,omitempty"`
@@ -351,6 +352,7 @@ func summarizeAssignment(assignment *workerv1.Assignment, receivedAt time.Time) 
 		task.Args = append([]string(nil), dockerPayload.Command...)
 		task.WorkDir = strings.TrimSpace(dockerPayload.WorkDir)
 		task.WorkspaceRoot = strings.TrimSpace(dockerPayload.WorkspaceRoot)
+		task.GPUCount = dockerPayload.GPUCount
 		task.EnvCount = len(dockerPayload.Env)
 		task.StorageMountCount = len(dockerPayload.Mounts)
 	default:

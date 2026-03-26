@@ -1,13 +1,18 @@
 package runtime
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	goRuntime "runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -100,7 +105,7 @@ printf 'err-tail' >&2`,
 
 func TestMountSingleStorageReportsProbeFailureDetails(t *testing.T) {
 	tempDir := t.TempDir()
-	prependFakeCommand(t, tempDir, "s3fs", "#!/bin/sh\nexit 0\n")
+	prependFakeCommand(t, tempDir, "rclone", "#!/bin/sh\nexit 0\n")
 	prependFakeCommand(t, tempDir, "fusermount3", "#!/bin/sh\nexit 0\n")
 
 	var logBuffer bytes.Buffer
@@ -114,8 +119,8 @@ func TestMountSingleStorageReportsProbeFailureDetails(t *testing.T) {
 			PathMode:   os.ModeDir | 0o755,
 			MountInfo: &storageMountInfo{
 				MountPoint:   mountPath,
-				Filesystem:   "fuse.s3fs",
-				Source:       "arco-test:/team-a/imagenet",
+				Filesystem:   "fuse.rclone",
+				Source:       "arco-test/team-a/imagenet",
 				MountOptions: "rw,nosuid,nodev,relatime",
 				SuperOptions: "rw,user_id=0,group_id=0",
 			},
@@ -135,7 +140,6 @@ func TestMountSingleStorageReportsProbeFailureDetails(t *testing.T) {
 		SecretAccessKey: "sk",
 		UsePathStyle:    true,
 		UseSSL:          true,
-		ExtraOptions:    []string{"listobjectsv2"},
 		MountPath:       filepath.Join(tempDir, "mnt"),
 	})
 	if err == nil {
@@ -144,15 +148,15 @@ func TestMountSingleStorageReportsProbeFailureDetails(t *testing.T) {
 
 	message := err.Error()
 	for _, fragment := range []string{
-		`s3fs reported success but mount path`,
+		`storage mount command reported success but mount path`,
 		`software caused connection abort`,
 		`bucket="arco-test"`,
 		`endpoint="https://s3.example.com"`,
 		`prefix="team-a/imagenet"`,
 		`region="us-east-1"`,
 		`use_path_style=true`,
-		`mount_source="arco-test:/team-a/imagenet"`,
-		`mount_fs="fuse.s3fs"`,
+		`mount_source="arco-test/team-a/imagenet"`,
+		`mount_fs="fuse.rclone"`,
 	} {
 		if !strings.Contains(message, fragment) {
 			t.Fatalf("mountSingleStorage() error = %q, want fragment %q", message, fragment)
@@ -166,7 +170,8 @@ func TestMountSingleStorageReportsProbeFailureDetails(t *testing.T) {
 
 func TestMountSingleStorageReportsMissingMountEntry(t *testing.T) {
 	tempDir := t.TempDir()
-	prependFakeCommand(t, tempDir, "s3fs", "#!/bin/sh\nexit 0\n")
+	prependFakeCommand(t, tempDir, "rclone", "#!/bin/sh\nexit 0\n")
+	prependFakeCommand(t, tempDir, "fusermount3", "#!/bin/sh\nexit 0\n")
 
 	var logBuffer bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
@@ -203,26 +208,36 @@ func TestMountSingleStorageReportsMissingMountEntry(t *testing.T) {
 	}
 }
 
-func TestCheckStorageToolsInstallsS3FSAutomatically(t *testing.T) {
+func TestCheckStorageToolsDownloadsRcloneAutomatically(t *testing.T) {
+	if goRuntime.GOOS != "linux" {
+		t.Skip("automatic rclone download is only supported on linux")
+	}
+
 	tempDir := t.TempDir()
-	prependFakeCommand(t, tempDir, "apt-get", `#!/bin/sh
-set -eu
-case "${1:-}" in
-	update)
-		exit 0
-		;;
-	install)
-		dir=${0%/*}
-		printf '%s\n' '#!/bin/sh' 'exit 0' >"$dir/s3fs"
-		/bin/chmod 0755 "$dir/s3fs"
-		exit 0
-		;;
-esac
-echo "unexpected apt-get arguments: $*" >&2
-exit 1
-`)
 	prependFakeCommand(t, tempDir, "fusermount3", "#!/bin/sh\nexit 0\n")
 	t.Setenv("PATH", tempDir)
+
+	archivePath := "/rclone-current-linux-" + currentRcloneTestArch(t) + ".zip"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != archivePath {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/zip")
+		if err := writeTestRcloneArchive(writer); err != nil {
+			t.Fatalf("writeTestRcloneArchive() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	previousDownloadBaseURL := rcloneDownloadBaseURL
+	previousInstallRoot := storageToolInstallRootOverride
+	rcloneDownloadBaseURL = server.URL
+	storageToolInstallRootOverride = filepath.Join(tempDir, "installed-rclone")
+	t.Cleanup(func() {
+		rcloneDownloadBaseURL = previousDownloadBaseURL
+		storageToolInstallRootOverride = previousInstallRoot
+	})
 
 	var logBuffer bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
@@ -231,41 +246,45 @@ exit 1
 		t.Fatalf("checkStorageTools() error = %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(tempDir, "s3fs")); err != nil {
-		t.Fatalf("installed s3fs binary missing: %v", err)
+	installedPath := filepath.Join(storageToolInstallRootOverride, storageMountTool)
+	info, err := os.Stat(installedPath)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", installedPath, err)
 	}
-	if !strings.Contains(logBuffer.String(), "installed s3fs automatically") {
-		t.Fatalf("expected installation log entry, got %s", logBuffer.String())
+	if info.Mode()&0o111 == 0 {
+		t.Fatalf("installed rclone mode = %#o, want executable bit set", info.Mode())
+	}
+	if !strings.Contains(logBuffer.String(), "downloaded rclone automatically") {
+		t.Fatalf("expected download log entry, got %s", logBuffer.String())
 	}
 }
 
-func TestCheckStorageToolsReportsAutomaticInstallFailure(t *testing.T) {
-	tempDir := t.TempDir()
-	prependFakeCommand(t, tempDir, "apt-get", "#!/bin/sh\necho 'repo unavailable' >&2\nexit 1\n")
-	prependFakeCommand(t, tempDir, "fusermount3", "#!/bin/sh\nexit 0\n")
-	t.Setenv("PATH", tempDir)
+func TestBuildRcloneRemoteSpecIncludesManagedOptions(t *testing.T) {
+	spec := buildRcloneRemoteSpec(StorageMount{
+		Bucket:          "bucket-a",
+		Prefix:          "team-a/data",
+		Endpoint:        "https://s3.example.com",
+		Region:          "us-east-1",
+		AccessKeyID:     "ak",
+		SecretAccessKey: "sk",
+		SessionToken:    "token-123",
+		UsePathStyle:    true,
+	})
 
-	var logBuffer bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
-
-	err := checkStorageTools(context.Background(), logger, []StorageMount{{MountPath: "/mnt/data"}})
-	if err == nil {
-		t.Fatal("checkStorageTools() error = nil, want automatic install failure")
-	}
-
-	message := err.Error()
 	for _, fragment := range []string{
-		`look up "s3fs"`,
-		`automatic install failed`,
-		`apt-get`,
-		`repo unavailable`,
+		`:s3,`,
+		`provider="Other"`,
+		`access_key_id="ak"`,
+		`secret_access_key="sk"`,
+		`endpoint="https://s3.example.com"`,
+		`region="us-east-1"`,
+		`session_token="token-123"`,
+		`force_path_style=true`,
+		`:bucket-a/team-a/data`,
 	} {
-		if !strings.Contains(message, fragment) {
-			t.Fatalf("checkStorageTools() error = %q, want fragment %q", message, fragment)
+		if !strings.Contains(spec, fragment) {
+			t.Fatalf("buildRcloneRemoteSpec() = %q, want fragment %q", spec, fragment)
 		}
-	}
-	if !strings.Contains(logBuffer.String(), "automatic s3fs install attempt failed") {
-		t.Fatalf("expected install failure log entry, got %s", logBuffer.String())
 	}
 }
 
@@ -283,4 +302,30 @@ func prependFakeCommand(t *testing.T, dir string, name string, body string) {
 		return
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+currentPath)
+}
+
+func currentRcloneTestArch(t *testing.T) string {
+	t.Helper()
+
+	switch goRuntime.GOARCH {
+	case "amd64":
+		return "amd64"
+	case "arm64":
+		return "arm64"
+	default:
+		t.Fatalf("unsupported GOARCH for rclone test fixture: %s", goRuntime.GOARCH)
+		return ""
+	}
+}
+
+func writeTestRcloneArchive(writer io.Writer) error {
+	zipWriter := zip.NewWriter(writer)
+	fileWriter, err := zipWriter.Create("rclone-test/rclone")
+	if err != nil {
+		return err
+	}
+	if _, err := fileWriter.Write([]byte("#!/bin/sh\nexit 0\n")); err != nil {
+		return err
+	}
+	return zipWriter.Close()
 }

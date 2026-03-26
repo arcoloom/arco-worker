@@ -30,6 +30,8 @@ type DockerEngine struct {
 var _ Engine = (*DockerEngine)(nil)
 var _ LogEmitterAware = (*DockerEngine)(nil)
 
+var inspectDockerRuntimes = dockerRuntimes
+
 // NewDockerEngine constructs an Engine backed by the Docker CLI.
 func NewDockerEngine(logger *slog.Logger) *DockerEngine {
 	if logger == nil {
@@ -239,6 +241,11 @@ func (e *DockerEngine) buildCommand(
 	if workDir := strings.TrimSpace(payload.WorkDir); workDir != "" {
 		args = append(args, "--workdir", workDir)
 	}
+	gpuArgs, err := dockerGPUArgs(ctx, payload)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	args = append(args, gpuArgs...)
 
 	for _, mount := range payload.Mounts {
 		mountPath := strings.TrimSpace(mount.MountPath)
@@ -436,4 +443,70 @@ func dockerContainerName(taskID string) string {
 		return strings.TrimRight(name[:120], "-")
 	}
 	return name
+}
+
+func dockerGPUArgs(ctx context.Context, payload DockerPayload) ([]string, error) {
+	if payload.GPUCount <= 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	args := []string{"--gpus", "all"}
+	runtimeName, err := detectDockerNVIDIARuntime(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if runtimeName != "" {
+		args = append(args, "--runtime", runtimeName)
+	}
+	return args, nil
+}
+
+func detectDockerNVIDIARuntime(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	runtimes, err := inspectDockerRuntimes(ctx)
+	if err != nil {
+		return "", nil
+	}
+	for name := range runtimes {
+		if strings.EqualFold(strings.TrimSpace(name), "nvidia") {
+			return name, nil
+		}
+	}
+	return "", nil
+}
+
+func dockerRuntimes(ctx context.Context) (map[string]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	command := exec.CommandContext(ctx, "docker", "info", "--format", "{{json .Runtimes}}")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		trimmed := strings.TrimSpace(string(output))
+		if trimmed != "" {
+			return nil, fmt.Errorf("docker info runtimes: %w: %s", err, trimmed)
+		}
+		return nil, fmt.Errorf("docker info runtimes: %w", err)
+	}
+
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" || trimmed == "null" {
+		return map[string]any{}, nil
+	}
+
+	var runtimes map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &runtimes); err != nil {
+		return nil, fmt.Errorf("decode docker runtimes: %w", err)
+	}
+	if runtimes == nil {
+		return map[string]any{}, nil
+	}
+	return runtimes, nil
 }

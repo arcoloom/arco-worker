@@ -13,12 +13,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/bodgit/sevenzip"
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/klauspost/compress/zstd"
 	"github.com/nwaples/rardecode"
 	"github.com/ulikunitz/xz"
@@ -123,10 +124,6 @@ func materializeSource(ctx context.Context, logger *slog.Logger, workspaceRoot s
 }
 
 func materializeGitSource(ctx context.Context, logger *slog.Logger, workspaceRoot string, source *SourceSpec) error {
-	if _, err := exec.LookPath("git"); err != nil {
-		return fmt.Errorf("git source requires git to be installed: %w", err)
-	}
-
 	uri := strings.TrimSpace(source.URI)
 	if uri == "" {
 		return fmt.Errorf("git source uri is required")
@@ -135,18 +132,84 @@ func materializeGitSource(ctx context.Context, logger *slog.Logger, workspaceRoo
 		logger.InfoContext(ctx, "materializing git source", slog.String("uri", uri), slog.String("workspace_root", workspaceRoot))
 	}
 
-	if output, err := exec.CommandContext(ctx, "git", "clone", uri, workspaceRoot).CombinedOutput(); err != nil {
-		return fmt.Errorf("git clone %q: %w: %s", uri, err, strings.TrimSpace(string(output)))
+	repo, err := git.PlainCloneContext(ctx, workspaceRoot, false, &git.CloneOptions{URL: uri})
+	if err != nil {
+		return fmt.Errorf("git clone %q: %w", uri, err)
 	}
 
 	revision := strings.TrimSpace(source.Revision)
 	if revision == "" {
 		return nil
 	}
-	if output, err := exec.CommandContext(ctx, "git", "-C", workspaceRoot, "checkout", revision).CombinedOutput(); err != nil {
-		return fmt.Errorf("git checkout %q: %w: %s", revision, err, strings.TrimSpace(string(output)))
+	if err := checkoutGitRevision(ctx, repo, revision); err != nil {
+		return fmt.Errorf("git checkout %q: %w", revision, err)
 	}
 	return nil
+}
+
+func checkoutGitRevision(ctx context.Context, repo *git.Repository, revision string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	if branchRefName, createBranch, branchHash, ok := resolveGitBranchCheckout(repo, revision); ok {
+		opts := &git.CheckoutOptions{Branch: branchRefName}
+		if createBranch {
+			opts.Create = true
+			opts.Hash = branchHash
+		}
+		return worktree.Checkout(opts)
+	}
+
+	hash, err := repo.ResolveRevision(plumbing.Revision(revision))
+	if err != nil {
+		return err
+	}
+	return worktree.Checkout(&git.CheckoutOptions{Hash: *hash})
+}
+
+func resolveGitBranchCheckout(repo *git.Repository, revision string) (plumbing.ReferenceName, bool, plumbing.Hash, bool) {
+	if branchRef := resolveExistingGitBranch(repo, revision); branchRef != "" {
+		return branchRef, false, plumbing.ZeroHash, true
+	}
+
+	if strings.HasPrefix(revision, "refs/") {
+		return "", false, plumbing.ZeroHash, false
+	}
+
+	remoteBranchName := plumbing.NewRemoteReferenceName(git.DefaultRemoteName, revision)
+	remoteBranchRef, err := repo.Reference(remoteBranchName, true)
+	if err != nil {
+		return "", false, plumbing.ZeroHash, false
+	}
+
+	return plumbing.NewBranchReferenceName(revision), true, remoteBranchRef.Hash(), true
+}
+
+func resolveExistingGitBranch(repo *git.Repository, revision string) plumbing.ReferenceName {
+	candidates := []plumbing.ReferenceName{
+		plumbing.ReferenceName(revision),
+	}
+	if !strings.HasPrefix(revision, "refs/") {
+		candidates = append(candidates, plumbing.NewBranchReferenceName(revision))
+	}
+
+	for _, candidate := range candidates {
+		ref, err := repo.Reference(candidate, true)
+		if err != nil {
+			continue
+		}
+		if ref.Name().IsBranch() {
+			return ref.Name()
+		}
+	}
+
+	return ""
 }
 
 func materializeArchiveSource(ctx context.Context, logger *slog.Logger, workspaceRoot string, source *SourceSpec) error {

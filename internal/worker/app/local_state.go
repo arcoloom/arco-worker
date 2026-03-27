@@ -20,6 +20,9 @@ type LocalStateConfig struct {
 	APIAddress             string
 	InstanceID             string
 	Provider               string
+	InstanceType           string
+	Region                 string
+	AvailabilityZone       string
 	WorkerVersion          string
 	ControlPlaneAddress    string
 	ControlPlaneServerName string
@@ -46,12 +49,17 @@ type localSnapshot struct {
 }
 
 type localWorkerSnapshot struct {
-	WorkerID        string     `json:"worker_id,omitempty"`
-	InstanceID      string     `json:"instance_id"`
-	Provider        string     `json:"provider"`
-	WorkerVersion   string     `json:"worker_version"`
-	ConnectedAt     *time.Time `json:"connected_at,omitempty"`
-	LastHeartbeatAt *time.Time `json:"last_heartbeat_at,omitempty"`
+	WorkerID         string     `json:"worker_id,omitempty"`
+	InstanceID       string     `json:"instance_id"`
+	Provider         string     `json:"provider"`
+	CloudVendor      string     `json:"cloud_vendor,omitempty"`
+	InstanceType     string     `json:"instance_type,omitempty"`
+	Region           string     `json:"region,omitempty"`
+	AvailabilityZone string     `json:"availability_zone,omitempty"`
+	AZ               string     `json:"az,omitempty"`
+	WorkerVersion    string     `json:"worker_version"`
+	ConnectedAt      *time.Time `json:"connected_at,omitempty"`
+	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at,omitempty"`
 }
 
 type localControlPlaneSnapshot struct {
@@ -138,9 +146,14 @@ func NewLocalState(config LocalStateConfig) *LocalState {
 			Phase:         "starting",
 			StatusMessage: "worker process started",
 			Worker: localWorkerSnapshot{
-				InstanceID:    strings.TrimSpace(config.InstanceID),
-				Provider:      strings.TrimSpace(config.Provider),
-				WorkerVersion: strings.TrimSpace(config.WorkerVersion),
+				InstanceID:       strings.TrimSpace(config.InstanceID),
+				Provider:         strings.TrimSpace(config.Provider),
+				CloudVendor:      strings.TrimSpace(config.Provider),
+				InstanceType:     strings.TrimSpace(config.InstanceType),
+				Region:           strings.TrimSpace(config.Region),
+				AvailabilityZone: strings.TrimSpace(config.AvailabilityZone),
+				AZ:               strings.TrimSpace(config.AvailabilityZone),
+				WorkerVersion:    strings.TrimSpace(config.WorkerVersion),
 			},
 			ControlPlane: localControlPlaneSnapshot{
 				Address:           strings.TrimSpace(config.ControlPlaneAddress),

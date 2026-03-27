@@ -34,6 +34,9 @@ func TestLocalAPIInfoSummarizesTaskAndShutdownState(t *testing.T) {
 		APIAddress:             DefaultLocalAPIListenAddress,
 		InstanceID:             "instance-1",
 		Provider:               "aws",
+		InstanceType:           "c7g.large",
+		Region:                 "us-west-2",
+		AvailabilityZone:       "us-west-2a",
 		WorkerVersion:          "test",
 		ControlPlaneAddress:    "127.0.0.1:8443",
 		ControlPlaneServerName: "workers.arcoloom.internal",
@@ -85,10 +88,15 @@ func TestLocalAPIInfoSummarizesTaskAndShutdownState(t *testing.T) {
 		APIAddress string `json:"api_address"`
 		Phase      string `json:"phase"`
 		Worker     struct {
-			WorkerID      string `json:"worker_id"`
-			InstanceID    string `json:"instance_id"`
-			Provider      string `json:"provider"`
-			WorkerVersion string `json:"worker_version"`
+			WorkerID         string `json:"worker_id"`
+			InstanceID       string `json:"instance_id"`
+			Provider         string `json:"provider"`
+			CloudVendor      string `json:"cloud_vendor"`
+			InstanceType     string `json:"instance_type"`
+			Region           string `json:"region"`
+			AvailabilityZone string `json:"availability_zone"`
+			AZ               string `json:"az"`
+			WorkerVersion    string `json:"worker_version"`
 		} `json:"worker"`
 		Task struct {
 			TaskID              string   `json:"task_id"`
@@ -142,6 +150,21 @@ func TestLocalAPIInfoSummarizesTaskAndShutdownState(t *testing.T) {
 	}
 	if response.Worker.InstanceID != "instance-1" {
 		t.Fatalf("instance_id = %q, want %q", response.Worker.InstanceID, "instance-1")
+	}
+	if response.Worker.CloudVendor != "aws" {
+		t.Fatalf("cloud_vendor = %q, want %q", response.Worker.CloudVendor, "aws")
+	}
+	if response.Worker.InstanceType != "c7g.large" {
+		t.Fatalf("instance_type = %q, want %q", response.Worker.InstanceType, "c7g.large")
+	}
+	if response.Worker.Region != "us-west-2" {
+		t.Fatalf("region = %q, want %q", response.Worker.Region, "us-west-2")
+	}
+	if response.Worker.AvailabilityZone != "us-west-2a" {
+		t.Fatalf("availability_zone = %q, want %q", response.Worker.AvailabilityZone, "us-west-2a")
+	}
+	if response.Worker.AZ != "us-west-2a" {
+		t.Fatalf("az = %q, want %q", response.Worker.AZ, "us-west-2a")
 	}
 	if response.Task.TaskID != "task-1" {
 		t.Fatalf("task_id = %q, want %q", response.Task.TaskID, "task-1")

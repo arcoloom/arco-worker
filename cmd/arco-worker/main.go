@@ -42,6 +42,8 @@ type config struct {
 // version is overridden in release builds via -ldflags.
 var version = "dev"
 
+const cloudMetadataResolveTimeout = time.Second
+
 func main() {
 	cfg, err := parseConfig(os.Args[1:])
 	if err != nil {
@@ -59,10 +61,20 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	metadataCtx, cancelMetadata := context.WithTimeout(ctx, cloudMetadataResolveTimeout)
+	cloudMetadata, metadataErr := workerApp.ResolveCloudMetadata(metadataCtx, cfg.Provider)
+	cancelMetadata()
+	if metadataErr != nil {
+		logger.Debug("cloud metadata unavailable", slog.String("provider", cfg.Provider), slog.String("error", metadataErr.Error()))
+	}
+
 	localState := workerApp.NewLocalState(workerApp.LocalStateConfig{
 		APIAddress:             workerApp.DefaultLocalAPIListenAddress,
 		InstanceID:             cfg.InstanceID,
 		Provider:               cfg.Provider,
+		InstanceType:           cloudMetadata.InstanceType,
+		Region:                 cloudMetadata.Region,
+		AvailabilityZone:       cloudMetadata.AvailabilityZone,
 		WorkerVersion:          version,
 		ControlPlaneAddress:    cfg.ControlPlaneAddress,
 		ControlPlaneServerName: cfg.ControlPlaneServerName,

@@ -28,10 +28,8 @@ import (
 	containerd "github.com/containerd/containerd/v2/client"
 	containerdcdi "github.com/containerd/containerd/v2/pkg/cdi"
 	"github.com/containerd/containerd/v2/pkg/cio"
-	"github.com/containerd/containerd/v2/pkg/netns"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/errdefs"
-	gocni "github.com/containerd/go-cni"
 	"github.com/containerd/platforms"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	officialcdi "tags.cncf.io/container-device-interface/pkg/cdi"
@@ -42,10 +40,6 @@ const (
 	managedContainerdNamespace         = "arco-worker"
 	managedContainerdRuntimeName       = "io.containerd.runc.v2"
 	managedContainerdConfigName        = "config.toml"
-	managedContainerdCNIConfigName     = "10-arco.conflist"
-	managedContainerdBridgeName        = "arco0"
-	managedContainerdDefaultSubnet     = "10.88.0.0/16"
-	managedContainerdDefaultGateway    = "10.88.0.1"
 	managedContainerdShutdownTimeout   = 5 * time.Second
 	managedContainerdConnectTimeout    = 3 * time.Second
 	managedContainerdReadyPollInterval = 250 * time.Millisecond
@@ -59,7 +53,6 @@ const (
 
 var managedContainerdVersion = "2.2.2"
 var managedRuncVersion = "1.4.1"
-var managedCNIPluginsVersion = "1.9.1"
 
 var managedContainerdInstallRootOverride string
 
@@ -78,7 +71,6 @@ type ContainerdEngine struct {
 	mountedStorage  []mountedStorage
 	preparedPayload *ContainerPayload
 	containerName   string
-	network         *managedContainerNetwork
 }
 
 type managedContainerdService struct {
@@ -90,7 +82,6 @@ type managedContainerdRuntime struct {
 	logger *slog.Logger
 	paths  managedContainerdPaths
 	client *containerd.Client
-	cni    gocni.CNI
 	cmd    *exec.Cmd
 
 	daemonDone chan struct{}
@@ -105,8 +96,6 @@ type managedContainerdPaths struct {
 	containerdBin        string
 	runcVersionDir       string
 	runcBin              string
-	cniVersionDir        string
-	cniBinDir            string
 	daemonDir            string
 	socketPath           string
 	rootDir              string
@@ -114,16 +103,8 @@ type managedContainerdPaths struct {
 	fifoDir              string
 	logPath              string
 	configPath           string
-	cniConfDir           string
-	cniConfPath          string
-	netNSDir             string
 	cdiSpecDir           string
 	nvidiaCDISpecPath    string
-}
-
-type managedContainerNetwork struct {
-	namespace *netns.NetNS
-	cniOpts   []gocni.NamespaceOpts
 }
 
 var _ Engine = (*ContainerdEngine)(nil)
@@ -229,15 +210,6 @@ func (e *ContainerdEngine) Start(ctx context.Context, payload []byte) error {
 		return err
 	}
 
-	network, err := runtime.prepareNetwork(logCtx, containerName, containerPayload.Ports)
-	if err != nil {
-		cleanupErr := e.cleanupStorage(logCtx, mounted)
-		if cleanupErr != nil {
-			return errors.Join(err, cleanupErr)
-		}
-		return err
-	}
-
 	container, task, waitCh, stdoutWriter, stderrWriter, err := runtime.createTask(
 		logCtx,
 		containerPayload,
@@ -245,25 +217,23 @@ func (e *ContainerdEngine) Start(ctx context.Context, payload []byte) error {
 		directoryMounts,
 		containerName,
 		logEmitter,
-		network,
 	)
 	if err != nil {
-		networkErr := runtime.teardownNetwork(logCtx, containerName, network)
 		cleanupErr := e.cleanupStorage(logCtx, mounted)
-		return errors.Join(err, networkErr, cleanupErr)
+		return errors.Join(err, cleanupErr)
 	}
 
 	e.mu.Lock()
 	if e.task != nil {
 		e.mu.Unlock()
-		cleanupErr := runtime.cleanupTaskAndContainer(logCtx, containerName, container, task, network)
+		cleanupErr := runtime.cleanupTaskAndContainer(logCtx, containerName, container, task)
 		storageErr := e.cleanupStorage(logCtx, mounted)
 		return errors.Join(errors.New("container workload already started"), cleanupErr, storageErr)
 	}
 
 	if err := task.Start(logCtx); err != nil {
 		e.mu.Unlock()
-		cleanupErr := runtime.cleanupTaskAndContainer(logCtx, containerName, container, task, network)
+		cleanupErr := runtime.cleanupTaskAndContainer(logCtx, containerName, container, task)
 		storageErr := e.cleanupStorage(logCtx, mounted)
 		startErr := fmt.Errorf("start container %q: %w", containerName, err)
 		return errors.Join(startErr, cleanupErr, storageErr)
@@ -277,9 +247,8 @@ func (e *ContainerdEngine) Start(ctx context.Context, payload []byte) error {
 	e.mountedStorage = mounted
 	e.preparedPayload = &containerPayload
 	e.containerName = containerName
-	e.network = network
 
-	go e.waitForExit(logCtx, runtime, container, task, waitCh, mounted, network, containerName, stdoutWriter, stderrWriter)
+	go e.waitForExit(logCtx, runtime, container, task, waitCh, mounted, containerName, stdoutWriter, stderrWriter)
 	e.mu.Unlock()
 
 	e.logger.InfoContext(
@@ -290,7 +259,6 @@ func (e *ContainerdEngine) Start(ctx context.Context, payload []byte) error {
 		slog.String("work_dir", containerPayload.WorkDir),
 		slog.Int("storage_mounts", len(mounted)),
 		slog.Int("directory_mounts", len(directoryMounts)),
-		slog.Int("port_mappings", len(containerPayload.Ports)),
 		slog.Int("gpu_devices", len(containerPayload.GPUDevices)),
 	)
 
@@ -356,7 +324,6 @@ func (e *ContainerdEngine) waitForExit(
 	task containerd.Task,
 	waitCh <-chan containerd.ExitStatus,
 	mounted []mountedStorage,
-	network *managedContainerNetwork,
 	containerName string,
 	stdoutWriter *lineEmitterWriter,
 	stderrWriter *lineEmitterWriter,
@@ -373,7 +340,7 @@ func (e *ContainerdEngine) waitForExit(
 		waitErr = ctx.Err()
 	}
 
-	cleanupErr := runtime.cleanupTaskAndContainer(ctx, containerName, container, task, network)
+	cleanupErr := runtime.cleanupTaskAndContainer(ctx, containerName, container, task)
 	stdoutWriter.Flush()
 	stderrWriter.Flush()
 
@@ -394,7 +361,6 @@ func (e *ContainerdEngine) waitForExit(
 	e.mountedStorage = nil
 	e.preparedPayload = nil
 	e.containerName = ""
-	e.network = nil
 	e.mu.Unlock()
 
 	if doneCh != nil {
@@ -465,17 +431,9 @@ func startManagedContainerdRuntime(ctx context.Context, logger *slog.Logger) (*m
 	if err := ensureManagedContainerdConfig(paths); err != nil {
 		return nil, err
 	}
-	if err := ensureManagedCNIConfig(paths); err != nil {
-		return nil, err
-	}
 
 	client, err := connectManagedContainerd(ctx, paths)
 	if err == nil {
-		cniInstance, loadErr := loadManagedCNI(paths)
-		if loadErr != nil {
-			_ = client.Close()
-			return nil, loadErr
-		}
 		if err := ensureManagedNamespace(ctx, client); err != nil {
 			_ = client.Close()
 			return nil, err
@@ -484,7 +442,6 @@ func startManagedContainerdRuntime(ctx context.Context, logger *slog.Logger) (*m
 			logger: logger,
 			paths:  paths,
 			client: client,
-			cni:    cniInstance,
 		}, nil
 	}
 
@@ -528,12 +485,6 @@ func startManagedContainerdRuntime(ctx context.Context, logger *slog.Logger) (*m
 		return nil, err
 	}
 
-	cniInstance, err := loadManagedCNI(paths)
-	if err != nil {
-		_ = client.Close()
-		_ = runtime.shutdown()
-		return nil, err
-	}
 	if err := ensureManagedNamespace(ctx, client); err != nil {
 		_ = client.Close()
 		_ = runtime.shutdown()
@@ -541,7 +492,6 @@ func startManagedContainerdRuntime(ctx context.Context, logger *slog.Logger) (*m
 	}
 
 	runtime.client = client
-	runtime.cni = cniInstance
 	return runtime, nil
 }
 
@@ -642,44 +592,6 @@ func (r *managedContainerdRuntime) ensureImage(ctx context.Context, imageRef str
 	return image, nil
 }
 
-func (r *managedContainerdRuntime) prepareNetwork(ctx context.Context, containerName string, ports []PortMapping) (*managedContainerNetwork, error) {
-	namespace, err := netns.NewNetNS(r.paths.netNSDir)
-	if err != nil {
-		return nil, fmt.Errorf("create network namespace for %q: %w", containerName, err)
-	}
-
-	opts := make([]gocni.NamespaceOpts, 0, 1)
-	if len(ports) > 0 {
-		opts = append(opts, gocni.WithCapabilityPortMap(cniPortMappings(ports)))
-	}
-
-	if _, err := r.cni.Setup(ctx, containerName, namespace.GetPath(), opts...); err != nil {
-		removeErr := r.cni.Remove(ctx, containerName, namespace.GetPath(), opts...)
-		netNSError := namespace.Remove()
-		return nil, errors.Join(fmt.Errorf("setup cni network for %q: %w", containerName, err), removeErr, netNSError)
-	}
-
-	return &managedContainerNetwork{
-		namespace: namespace,
-		cniOpts:   opts,
-	}, nil
-}
-
-func (r *managedContainerdRuntime) teardownNetwork(ctx context.Context, containerName string, network *managedContainerNetwork) error {
-	if network == nil || network.namespace == nil {
-		return nil
-	}
-
-	var errs []error
-	if err := r.cni.Remove(ctx, containerName, network.namespace.GetPath(), network.cniOpts...); err != nil {
-		errs = append(errs, err)
-	}
-	if err := network.namespace.Remove(); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
-}
-
 func (r *managedContainerdRuntime) createTask(
 	ctx context.Context,
 	payload ContainerPayload,
@@ -687,14 +599,13 @@ func (r *managedContainerdRuntime) createTask(
 	directoryMounts []resolvedContainerMount,
 	containerName string,
 	emitter LogEmitter,
-	network *managedContainerNetwork,
 ) (containerd.Container, containerd.Task, <-chan containerd.ExitStatus, *lineEmitterWriter, *lineEmitterWriter, error) {
 	image, err := r.ensureImage(ctx, payload.Image)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
 
-	specOpts, err := containerSpecOpts(payload, mountedStorage, directoryMounts, image, network)
+	specOpts, err := containerSpecOpts(payload, mountedStorage, directoryMounts, image)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
@@ -729,7 +640,7 @@ func (r *managedContainerdRuntime) createTask(
 
 	waitCh, err := task.Wait(ctx)
 	if err != nil {
-		cleanupErr := r.cleanupTaskAndContainer(ctx, containerName, container, task, network)
+		cleanupErr := r.cleanupTaskAndContainer(ctx, containerName, container, task)
 		return nil, nil, nil, nil, nil, errors.Join(fmt.Errorf("wait on task for container %q: %w", containerName, err), cleanupErr)
 	}
 
@@ -741,7 +652,6 @@ func (r *managedContainerdRuntime) cleanupTaskAndContainer(
 	containerName string,
 	container containerd.Container,
 	task containerd.Task,
-	network *managedContainerNetwork,
 ) error {
 	var errs []error
 
@@ -755,7 +665,6 @@ func (r *managedContainerdRuntime) cleanupTaskAndContainer(
 			errs = append(errs, fmt.Errorf("delete container %q: %w", containerName, err))
 		}
 	}
-	errs = append(errs, r.teardownNetwork(ctx, containerName, network))
 	return errors.Join(errs...)
 }
 
@@ -773,7 +682,7 @@ func (r *managedContainerdRuntime) cleanupContainer(ctx context.Context, contain
 		return fmt.Errorf("load existing task for container %q: %w", containerName, err)
 	}
 
-	if err := r.cleanupTaskAndContainer(ctx, containerName, container, task, nil); err != nil {
+	if err := r.cleanupTaskAndContainer(ctx, containerName, container, task); err != nil {
 		return err
 	}
 	return nil
@@ -792,8 +701,6 @@ func managedContainerdRuntimePaths() (managedContainerdPaths, error) {
 		containerdBin:        filepath.Join(installRoot, "containerd", managedContainerdVersion, "bin", "containerd"),
 		runcVersionDir:       filepath.Join(installRoot, "runc", managedRuncVersion),
 		runcBin:              filepath.Join(installRoot, "runc", managedRuncVersion, "runc"),
-		cniVersionDir:        filepath.Join(installRoot, "cni-plugins", managedCNIPluginsVersion),
-		cniBinDir:            filepath.Join(installRoot, "cni-plugins", managedCNIPluginsVersion, "bin"),
 		daemonDir:            filepath.Join(installRoot, "daemon"),
 		socketPath:           filepath.Join(installRoot, "daemon", "containerd.sock"),
 		rootDir:              filepath.Join(installRoot, "daemon", "root"),
@@ -801,9 +708,6 @@ func managedContainerdRuntimePaths() (managedContainerdPaths, error) {
 		fifoDir:              filepath.Join(installRoot, "daemon", "fifo"),
 		logPath:              filepath.Join(installRoot, "daemon", "containerd.log"),
 		configPath:           filepath.Join(installRoot, "daemon", managedContainerdConfigName),
-		cniConfDir:           filepath.Join(installRoot, "cni", "conf"),
-		cniConfPath:          filepath.Join(installRoot, "cni", "conf", managedContainerdCNIConfigName),
-		netNSDir:             filepath.Join(installRoot, "cni", "netns"),
 		cdiSpecDir:           filepath.Join(string(os.PathSeparator), "var", "run", "cdi"),
 		nvidiaCDISpecPath:    filepath.Join(string(os.PathSeparator), "var", "run", "cdi", managedNVIDIACDISpecName),
 	}, nil
@@ -827,7 +731,7 @@ func ensureManagedContainerdArtifacts(ctx context.Context, logger *slog.Logger, 
 	if err := os.MkdirAll(paths.installRoot, 0o755); err != nil {
 		return fmt.Errorf("create managed runtime root %q: %w", paths.installRoot, err)
 	}
-	for _, dir := range []string{paths.daemonDir, paths.rootDir, paths.stateDir, paths.fifoDir, paths.cniConfDir, paths.netNSDir, paths.cdiSpecDir} {
+	for _, dir := range []string{paths.daemonDir, paths.rootDir, paths.stateDir, paths.fifoDir, paths.cdiSpecDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("create managed runtime directory %q: %w", dir, err)
 		}
@@ -837,9 +741,6 @@ func ensureManagedContainerdArtifacts(ctx context.Context, logger *slog.Logger, 
 		return err
 	}
 	if err := ensureManagedRuncBinary(ctx, logger, paths); err != nil {
-		return err
-	}
-	if err := ensureManagedCNIPlugins(ctx, logger, paths); err != nil {
 		return err
 	}
 	return nil
@@ -890,33 +791,6 @@ func ensureManagedRuncBinary(ctx context.Context, logger *slog.Logger, paths man
 	return downloadExecutable(ctx, url, paths.runcBin)
 }
 
-func ensureManagedCNIPlugins(ctx context.Context, logger *slog.Logger, paths managedContainerdPaths) error {
-	required := []string{
-		filepath.Join(paths.cniBinDir, "bridge"),
-		filepath.Join(paths.cniBinDir, "host-local"),
-		filepath.Join(paths.cniBinDir, "loopback"),
-		filepath.Join(paths.cniBinDir, "portmap"),
-	}
-	if allPathsExist(required) {
-		return nil
-	}
-
-	arch, err := managedContainerdReleaseArch()
-	if err != nil {
-		return err
-	}
-	url := fmt.Sprintf(
-		"https://github.com/containernetworking/plugins/releases/download/v%s/cni-plugins-linux-%s-v%s.tgz",
-		managedCNIPluginsVersion,
-		arch,
-		managedCNIPluginsVersion,
-	)
-	if logger != nil {
-		logger.InfoContext(ctx, "installing managed cni plugins", slog.String("version", managedCNIPluginsVersion), slog.String("url", url))
-	}
-	return downloadAndExtractTarGz(ctx, url, paths.cniVersionDir)
-}
-
 func ensureManagedContainerdConfig(paths managedContainerdPaths) error {
 	config := strings.Join([]string{
 		"version = 3",
@@ -924,55 +798,6 @@ func ensureManagedContainerdConfig(paths managedContainerdPaths) error {
 		"",
 	}, "\n")
 	return writeFileAtomically(paths.configPath, []byte(config), 0o644)
-}
-
-func ensureManagedCNIConfig(paths managedContainerdPaths) error {
-	config := fmt.Sprintf(`{
-  "cniVersion": "1.0.0",
-  "name": "arco",
-  "plugins": [
-    {
-      "type": "bridge",
-      "bridge": %q,
-      "isGateway": true,
-      "ipMasq": true,
-      "hairpinMode": true,
-      "capabilities": {
-        "portMappings": true
-      },
-      "ipam": {
-        "type": "host-local",
-        "ranges": [
-          [
-            {
-              "subnet": %q,
-              "gateway": %q
-            }
-          ]
-        ],
-        "routes": [
-          {
-            "dst": "0.0.0.0/0"
-          }
-        ]
-      }
-    },
-    {
-      "type": "portmap",
-      "capabilities": {
-        "portMappings": true
-      }
-    },
-    {
-      "type": "firewall"
-    },
-    {
-      "type": "tuning"
-    }
-  ]
-}
-`, managedContainerdBridgeName, managedContainerdDefaultSubnet, managedContainerdDefaultGateway)
-	return writeFileAtomically(paths.cniConfPath, []byte(config), 0o644)
 }
 
 func connectManagedContainerd(ctx context.Context, paths managedContainerdPaths) (*containerd.Client, error) {
@@ -1023,20 +848,6 @@ func ensureManagedNamespace(ctx context.Context, client *containerd.Client) erro
 		return fmt.Errorf("create containerd namespace %q: %w", managedContainerdNamespace, err)
 	}
 	return nil
-}
-
-func loadManagedCNI(paths managedContainerdPaths) (gocni.CNI, error) {
-	cniInstance, err := gocni.New(
-		gocni.WithPluginDir([]string{paths.cniBinDir}),
-		gocni.WithPluginConfDir(paths.cniConfDir),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create managed cni client: %w", err)
-	}
-	if err := cniInstance.Load(gocni.WithDefaultConf, gocni.WithLoNetwork); err != nil {
-		return nil, fmt.Errorf("load managed cni config: %w", err)
-	}
-	return cniInstance, nil
 }
 
 func (r *managedContainerdRuntime) ensureNVIDIACDI(ctx context.Context, payload ContainerPayload) ([]string, error) {
@@ -1344,7 +1155,6 @@ func containerSpecOpts(
 	_ []mountedStorage,
 	directoryMounts []resolvedContainerMount,
 	image containerd.Image,
-	network *managedContainerNetwork,
 ) ([]oci.SpecOpts, error) {
 	mounts, err := containerSpecMounts(payload, directoryMounts)
 	if err != nil {
@@ -1357,6 +1167,7 @@ func containerSpecOpts(
 		oci.WithHostHostsFile,
 		oci.WithHostResolvconf,
 		oci.WithHostLocaltime,
+		oci.WithHostNamespace(specs.NetworkNamespace),
 		oci.WithMounts(mounts),
 	}
 
@@ -1368,12 +1179,6 @@ func containerSpecOpts(
 	}
 	if env := containerSpecEnv(payload.Env); len(env) > 0 {
 		specOpts = append(specOpts, oci.WithEnv(env))
-	}
-	if network != nil && network.namespace != nil {
-		specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
-			Type: specs.NetworkNamespace,
-			Path: network.namespace.GetPath(),
-		}))
 	}
 	if len(payload.GPUDevices) > 0 {
 		specOpts = append(specOpts, containerdcdi.WithCDIDevices(payload.GPUDevices...))
@@ -1454,26 +1259,6 @@ func containerSpecEnv(values map[string]string) []string {
 		env = append(env, key+"="+values[key])
 	}
 	return env
-}
-
-func cniPortMappings(ports []PortMapping) []gocni.PortMapping {
-	if len(ports) == 0 {
-		return nil
-	}
-
-	result := make([]gocni.PortMapping, 0, len(ports))
-	for _, mapping := range ports {
-		protocol := strings.ToLower(strings.TrimSpace(mapping.Protocol))
-		if protocol == "" {
-			protocol = "tcp"
-		}
-		result = append(result, gocni.PortMapping{
-			HostPort:      int32(mapping.HostPort),
-			ContainerPort: int32(mapping.ContainerPort),
-			Protocol:      protocol,
-		})
-	}
-	return result
 }
 
 func normalizeContainerdExitStatus(status containerd.ExitStatus) error {

@@ -55,30 +55,6 @@ func parseContainerPayload(ctx context.Context, raw []byte) (ContainerPayload, e
 			return ContainerPayload{}, fmt.Errorf("container payload directory_mounts[%d].target is required", index)
 		}
 	}
-	for index, mapping := range payload.Ports {
-		if mapping.ContainerPort < 1 || mapping.ContainerPort > 65535 {
-			return ContainerPayload{}, fmt.Errorf("container payload ports[%d].container_port must be between 1 and 65535", index)
-		}
-		hostPort := mapping.HostPort
-		if hostPort == 0 {
-			hostPort = mapping.ContainerPort
-			payload.Ports[index].HostPort = hostPort
-		}
-		if hostPort < 1 || hostPort > 65535 {
-			return ContainerPayload{}, fmt.Errorf("container payload ports[%d].host_port must be between 1 and 65535", index)
-		}
-		protocol := strings.ToLower(strings.TrimSpace(mapping.Protocol))
-		if protocol == "" {
-			protocol = "tcp"
-		}
-		switch protocol {
-		case "tcp", "udp":
-			payload.Ports[index].Protocol = protocol
-		default:
-			return ContainerPayload{}, fmt.Errorf("container payload ports[%d].protocol must be tcp or udp", index)
-		}
-	}
-
 	return payload, nil
 }
 

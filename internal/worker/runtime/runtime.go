@@ -65,12 +65,6 @@ type ContainerMount struct {
 	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
-type PortMapping struct {
-	ContainerPort int    `json:"container_port"`
-	HostPort      int    `json:"host_port,omitempty"`
-	Protocol      string `json:"protocol,omitempty"`
-}
-
 // ExecPayload describes a workload launched directly as a host process.
 type ExecPayload struct {
 	TaskID        string            `json:"task_id"`
@@ -94,7 +88,6 @@ type ContainerPayload struct {
 	WorkDir         string            `json:"work_dir"`
 	Mounts          []StorageMount    `json:"mounts,omitempty"`
 	DirectoryMounts []ContainerMount  `json:"directory_mounts,omitempty"`
-	Ports           []PortMapping     `json:"ports,omitempty"`
 	GPUCount        int               `json:"gpu_count,omitempty"`
 	GPUDevices      []string          `json:"gpu_devices,omitempty"`
 }

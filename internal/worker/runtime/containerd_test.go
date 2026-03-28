@@ -7,27 +7,6 @@ import (
 	"testing"
 )
 
-func TestParseContainerPayloadDefaultsHostPortAndProtocol(t *testing.T) {
-	t.Parallel()
-
-	payload, err := parseContainerPayload(context.Background(), []byte(`{
-		"task_id": "task-1",
-		"workspace_root": "/tmp/workspace",
-		"image": "ghcr.io/arcoloom/demo:latest",
-		"ports": [{"container_port": 8080}]
-	}`))
-	if err != nil {
-		t.Fatalf("parseContainerPayload() error = %v", err)
-	}
-
-	if got := payload.Ports[0].HostPort; got != 8080 {
-		t.Fatalf("parseContainerPayload() host_port = %d, want 8080", got)
-	}
-	if got := payload.Ports[0].Protocol; got != "tcp" {
-		t.Fatalf("parseContainerPayload() protocol = %q, want tcp", got)
-	}
-}
-
 func TestParseContainerPayloadNormalizesGPUDevices(t *testing.T) {
 	t.Parallel()
 

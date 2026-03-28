@@ -266,7 +266,7 @@ func (r *Runner) waitForAssignment(ctx context.Context, session ControlPlaneSess
 			workerID = payload.HelloAck.GetWorkerId()
 			terminalSessionToken = payload.HelloAck.GetTerminalSessionToken()
 			if r.localState != nil {
-				r.localState.MarkWorkerConnected(workerID)
+				r.localState.MarkWorkerConnected(payload.HelloAck)
 			}
 		case *workerv1.ControlToWorker_Assignment:
 			return workerID, terminalSessionToken, payload.Assignment, nil

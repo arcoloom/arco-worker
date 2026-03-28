@@ -59,6 +59,18 @@ type SourceSpec struct {
 	Path     string `json:"path,omitempty"`
 }
 
+type ContainerMount struct {
+	Source   string `json:"source"`
+	Target   string `json:"target"`
+	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
+type PortMapping struct {
+	ContainerPort int    `json:"container_port"`
+	HostPort      int    `json:"host_port,omitempty"`
+	Protocol      string `json:"protocol,omitempty"`
+}
+
 // ExecPayload describes a workload launched directly as a host process.
 type ExecPayload struct {
 	TaskID        string            `json:"task_id"`
@@ -71,15 +83,18 @@ type ExecPayload struct {
 	Mounts        []StorageMount    `json:"mounts,omitempty"`
 }
 
-// DockerPayload describes a workload launched as a Docker container.
-type DockerPayload struct {
-	TaskID        string            `json:"task_id"`
-	WorkspaceRoot string            `json:"workspace_root"`
-	Source        *SourceSpec       `json:"source,omitempty"`
-	Image         string            `json:"image"`
-	Command       []string          `json:"command,omitempty"`
-	Env           map[string]string `json:"env"`
-	WorkDir       string            `json:"work_dir"`
-	Mounts        []StorageMount    `json:"mounts,omitempty"`
-	GPUCount      int               `json:"gpu_count,omitempty"`
+// ContainerPayload describes a workload launched as a containerd-backed container.
+type ContainerPayload struct {
+	TaskID          string            `json:"task_id"`
+	WorkspaceRoot   string            `json:"workspace_root"`
+	Source          *SourceSpec       `json:"source,omitempty"`
+	Image           string            `json:"image"`
+	Command         []string          `json:"command,omitempty"`
+	Env             map[string]string `json:"env"`
+	WorkDir         string            `json:"work_dir"`
+	Mounts          []StorageMount    `json:"mounts,omitempty"`
+	DirectoryMounts []ContainerMount  `json:"directory_mounts,omitempty"`
+	Ports           []PortMapping     `json:"ports,omitempty"`
+	GPUCount        int               `json:"gpu_count,omitempty"`
+	GPUDevices      []string          `json:"gpu_devices,omitempty"`
 }

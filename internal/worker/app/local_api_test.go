@@ -34,9 +34,6 @@ func TestLocalAPIInfoSummarizesTaskAndShutdownState(t *testing.T) {
 		APIAddress:             DefaultLocalAPIListenAddress,
 		InstanceID:             "instance-1",
 		Provider:               "aws",
-		InstanceType:           "c7g.large",
-		Region:                 "us-west-2",
-		AvailabilityZone:       "us-west-2a",
 		WorkerVersion:          "test",
 		ControlPlaneAddress:    "127.0.0.1:8443",
 		ControlPlaneServerName: "workers.arcoloom.internal",
@@ -45,7 +42,13 @@ func TestLocalAPIInfoSummarizesTaskAndShutdownState(t *testing.T) {
 		StopTimeout:            15 * time.Second,
 	})
 	state.MarkControlPlaneConnected()
-	state.MarkWorkerConnected("worker-1")
+	state.MarkWorkerConnected(&workerv1.HelloAck{
+		WorkerId:         "worker-1",
+		CloudVendor:      "aws",
+		InstanceType:     "c7g.large",
+		Region:           "us-west-2",
+		AvailabilityZone: "us-west-2a",
+	})
 	state.SetAssignment(&workerv1.Assignment{
 		TaskId:      "task-1",
 		RuntimeKind: workerv1.RuntimeKind_RUNTIME_KIND_EXEC,

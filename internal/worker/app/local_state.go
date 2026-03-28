@@ -20,9 +20,6 @@ type LocalStateConfig struct {
 	APIAddress             string
 	InstanceID             string
 	Provider               string
-	InstanceType           string
-	Region                 string
-	AvailabilityZone       string
 	WorkerVersion          string
 	ControlPlaneAddress    string
 	ControlPlaneServerName string
@@ -146,14 +143,9 @@ func NewLocalState(config LocalStateConfig) *LocalState {
 			Phase:         "starting",
 			StatusMessage: "worker process started",
 			Worker: localWorkerSnapshot{
-				InstanceID:       strings.TrimSpace(config.InstanceID),
-				Provider:         strings.TrimSpace(config.Provider),
-				CloudVendor:      strings.TrimSpace(config.Provider),
-				InstanceType:     strings.TrimSpace(config.InstanceType),
-				Region:           strings.TrimSpace(config.Region),
-				AvailabilityZone: strings.TrimSpace(config.AvailabilityZone),
-				AZ:               strings.TrimSpace(config.AvailabilityZone),
-				WorkerVersion:    strings.TrimSpace(config.WorkerVersion),
+				InstanceID:    strings.TrimSpace(config.InstanceID),
+				Provider:      strings.TrimSpace(config.Provider),
+				WorkerVersion: strings.TrimSpace(config.WorkerVersion),
 			},
 			ControlPlane: localControlPlaneSnapshot{
 				Address:           strings.TrimSpace(config.ControlPlaneAddress),
@@ -215,14 +207,27 @@ func (s *LocalState) MarkControlPlaneConnected() {
 	s.snapshot.StatusMessage = "waiting for control plane assignment"
 }
 
-func (s *LocalState) MarkWorkerConnected(workerID string) {
-	if s == nil {
+func (s *LocalState) MarkWorkerConnected(helloAck *workerv1.HelloAck) {
+	if s == nil || helloAck == nil {
 		return
 	}
 	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.snapshot.Worker.WorkerID = strings.TrimSpace(workerID)
+	s.snapshot.Worker.WorkerID = strings.TrimSpace(helloAck.GetWorkerId())
+	if vendor := strings.TrimSpace(helloAck.GetCloudVendor()); vendor != "" {
+		s.snapshot.Worker.CloudVendor = vendor
+	}
+	if instanceType := strings.TrimSpace(helloAck.GetInstanceType()); instanceType != "" {
+		s.snapshot.Worker.InstanceType = instanceType
+	}
+	if region := strings.TrimSpace(helloAck.GetRegion()); region != "" {
+		s.snapshot.Worker.Region = region
+	}
+	if availabilityZone := strings.TrimSpace(helloAck.GetAvailabilityZone()); availabilityZone != "" {
+		s.snapshot.Worker.AvailabilityZone = availabilityZone
+		s.snapshot.Worker.AZ = availabilityZone
+	}
 	s.snapshot.Worker.ConnectedAt = &now
 	if s.snapshot.Phase == "" || s.snapshot.Phase == "starting" || s.snapshot.Phase == "connecting" {
 		s.snapshot.Phase = "waiting_assignment"
@@ -354,20 +359,20 @@ func summarizeAssignment(assignment *workerv1.Assignment, receivedAt time.Time) 
 		task.WorkspaceRoot = strings.TrimSpace(execPayload.WorkspaceRoot)
 		task.EnvCount = len(execPayload.Env)
 		task.StorageMountCount = len(execPayload.Mounts)
-	case workerv1.RuntimeKind_RUNTIME_KIND_DOCKER:
-		var dockerPayload workerRuntime.DockerPayload
-		if err := json.Unmarshal(payload, &dockerPayload); err != nil {
+	case workerv1.RuntimeKind_RUNTIME_KIND_CONTAINER:
+		var containerPayload workerRuntime.ContainerPayload
+		if err := json.Unmarshal(payload, &containerPayload); err != nil {
 			task.ParseError = err.Error()
 			return task
 		}
-		task.Source = summarizeSource(dockerPayload.Source)
-		task.Image = strings.TrimSpace(dockerPayload.Image)
-		task.Args = append([]string(nil), dockerPayload.Command...)
-		task.WorkDir = strings.TrimSpace(dockerPayload.WorkDir)
-		task.WorkspaceRoot = strings.TrimSpace(dockerPayload.WorkspaceRoot)
-		task.GPUCount = dockerPayload.GPUCount
-		task.EnvCount = len(dockerPayload.Env)
-		task.StorageMountCount = len(dockerPayload.Mounts)
+		task.Source = summarizeSource(containerPayload.Source)
+		task.Image = strings.TrimSpace(containerPayload.Image)
+		task.Args = append([]string(nil), containerPayload.Command...)
+		task.WorkDir = strings.TrimSpace(containerPayload.WorkDir)
+		task.WorkspaceRoot = strings.TrimSpace(containerPayload.WorkspaceRoot)
+		task.GPUCount = containerPayload.GPUCount
+		task.EnvCount = len(containerPayload.Env)
+		task.StorageMountCount = len(containerPayload.Mounts) + len(containerPayload.DirectoryMounts)
 	default:
 		if len(payload) > 0 {
 			task.ParseError = "assignment payload is not summarized for this runtime"
@@ -482,8 +487,8 @@ func runtimeKindName(kind workerv1.RuntimeKind) string {
 	switch kind {
 	case workerv1.RuntimeKind_RUNTIME_KIND_EXEC:
 		return "exec"
-	case workerv1.RuntimeKind_RUNTIME_KIND_DOCKER:
-		return "docker"
+	case workerv1.RuntimeKind_RUNTIME_KIND_CONTAINER:
+		return "container"
 	default:
 		return "unspecified"
 	}

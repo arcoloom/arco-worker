@@ -166,6 +166,87 @@ func TestRunnerUsesUndeadlinedStreamContext(t *testing.T) {
 	}
 }
 
+func TestRunnerStoresWorkerMetadataFromHelloAck(t *testing.T) {
+	t.Parallel()
+
+	state := NewLocalState(LocalStateConfig{
+		APIAddress:        DefaultLocalAPIListenAddress,
+		InstanceID:        "instance-1",
+		Provider:          "bootstrap-provider",
+		WorkerVersion:     "test",
+		ConnectTimeout:    time.Second,
+		HeartbeatInterval: time.Hour,
+	})
+	session := &scriptedSession{
+		messages: []*workerv1.ControlToWorker{
+			{
+				Message: &workerv1.ControlToWorker_HelloAck{
+					HelloAck: &workerv1.HelloAck{
+						WorkerId:             "worker-1",
+						TerminalSessionToken: "terminal-token-1",
+						CloudVendor:          "aws",
+						InstanceType:         "c7g.large",
+						Region:               "us-west-2",
+						AvailabilityZone:     "us-west-2a",
+					},
+				},
+			},
+			{
+				Message: &workerv1.ControlToWorker_Assignment{
+					Assignment: &workerv1.Assignment{
+						TaskId:      "task-1",
+						RuntimeKind: workerv1.RuntimeKind_RUNTIME_KIND_EXEC,
+						Payload:     `{"command":"true"}`,
+					},
+				},
+			},
+		},
+	}
+
+	client := &fakeControlPlaneClient{session: session}
+	runner, err := NewRunner(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		client,
+		func(context.Context, workerv1.RuntimeKind) (workerRuntime.Engine, error) { return fakeEngine{}, nil },
+		RunnerConfig{
+			InstanceID:        "instance-1",
+			Provider:          "bootstrap-provider",
+			RegistrationToken: "token-1",
+			WorkerVersion:     "test",
+			ConnectTimeout:    time.Second,
+			HeartbeatInterval: time.Hour,
+			LocalState:        state,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewRunner() error = %v", err)
+	}
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	snapshot := state.Snapshot()
+	if snapshot.Worker.Provider != "bootstrap-provider" {
+		t.Fatalf("provider = %q, want %q", snapshot.Worker.Provider, "bootstrap-provider")
+	}
+	if snapshot.Worker.CloudVendor != "aws" {
+		t.Fatalf("cloud_vendor = %q, want %q", snapshot.Worker.CloudVendor, "aws")
+	}
+	if snapshot.Worker.InstanceType != "c7g.large" {
+		t.Fatalf("instance_type = %q, want %q", snapshot.Worker.InstanceType, "c7g.large")
+	}
+	if snapshot.Worker.Region != "us-west-2" {
+		t.Fatalf("region = %q, want %q", snapshot.Worker.Region, "us-west-2")
+	}
+	if snapshot.Worker.AvailabilityZone != "us-west-2a" {
+		t.Fatalf("availability_zone = %q, want %q", snapshot.Worker.AvailabilityZone, "us-west-2a")
+	}
+	if snapshot.Worker.AZ != "us-west-2a" {
+		t.Fatalf("az = %q, want %q", snapshot.Worker.AZ, "us-west-2a")
+	}
+}
+
 func TestRunnerTimesOutDuringHandshake(t *testing.T) {
 	session := &scriptedSession{
 		receive: func(ctx context.Context) (*workerv1.ControlToWorker, error) {

@@ -125,6 +125,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	type handshakeResult struct {
 		workerID             string
 		terminalSessionToken string
+		cloudVendor          string
 		assignment           *workerv1.Assignment
 		err                  error
 	}
@@ -144,10 +145,11 @@ func (r *Runner) Run(ctx context.Context) error {
 			return
 		}
 
-		workerID, terminalSessionToken, assignment, err := r.waitForAssignment(streamCtx, session)
+		workerID, terminalSessionToken, cloudVendor, assignment, err := r.waitForAssignment(streamCtx, session)
 		handshakeCh <- handshakeResult{
 			workerID:             workerID,
 			terminalSessionToken: terminalSessionToken,
+			cloudVendor:          cloudVendor,
 			assignment:           assignment,
 			err:                  err,
 		}
@@ -159,6 +161,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	var (
 		workerID             string
 		terminalSessionToken string
+		cloudVendor          string
 		assignment           *workerv1.Assignment
 	)
 	select {
@@ -181,6 +184,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		workerID = result.workerID
 		terminalSessionToken = result.terminalSessionToken
+		cloudVendor = result.cloudVendor
 		assignment = result.assignment
 	case <-timer.C:
 		stopStream()
@@ -240,7 +244,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer stopHeartbeats()
 	go r.runHeartbeats(heartbeatCtx, session, workerID)
 
-	if err := r.runAssignment(ctx, session, assignment); err != nil {
+	if err := r.runAssignment(ctx, session, assignment, cloudVendor); err != nil {
 		if r.localState != nil {
 			r.localState.SetPhase("failed", err.Error())
 		}
@@ -249,40 +253,42 @@ func (r *Runner) Run(ctx context.Context) error {
 	return r.waitForControlPlaneClosure(ctx, session)
 }
 
-func (r *Runner) waitForAssignment(ctx context.Context, session ControlPlaneSession) (string, string, *workerv1.Assignment, error) {
+func (r *Runner) waitForAssignment(ctx context.Context, session ControlPlaneSession) (string, string, string, *workerv1.Assignment, error) {
 	workerID := ""
 	terminalSessionToken := ""
+	cloudVendor := ""
 	for {
 		message, err := session.Receive(ctx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return "", "", nil, errors.New("control plane closed the stream before assignment")
+				return "", "", "", nil, errors.New("control plane closed the stream before assignment")
 			}
-			return "", "", nil, fmt.Errorf("receive control-plane message: %w", err)
+			return "", "", "", nil, fmt.Errorf("receive control-plane message: %w", err)
 		}
 
 		switch payload := message.GetMessage().(type) {
 		case *workerv1.ControlToWorker_HelloAck:
 			workerID = payload.HelloAck.GetWorkerId()
 			terminalSessionToken = payload.HelloAck.GetTerminalSessionToken()
+			cloudVendor = payload.HelloAck.GetCloudVendor()
 			if r.localState != nil {
 				r.localState.MarkWorkerConnected(payload.HelloAck)
 			}
 		case *workerv1.ControlToWorker_Assignment:
-			return workerID, terminalSessionToken, payload.Assignment, nil
+			return workerID, terminalSessionToken, cloudVendor, payload.Assignment, nil
 		case *workerv1.ControlToWorker_Shutdown:
 			reason := payload.Shutdown.GetReason()
 			if reason == "" {
 				reason = "control plane requested shutdown before assignment"
 			}
-			return "", "", nil, &controlPlaneShutdownError{reason: reason}
+			return "", "", "", nil, &controlPlaneShutdownError{reason: reason}
 		default:
-			return "", "", nil, errors.New("received unsupported control-plane message")
+			return "", "", "", nil, errors.New("received unsupported control-plane message")
 		}
 	}
 }
 
-func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession, assignment *workerv1.Assignment) error {
+func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession, assignment *workerv1.Assignment, cloudVendor string) error {
 	taskID := assignment.GetTaskId()
 	if taskID == "" {
 		return errors.New("assignment returned an empty task ID")
@@ -312,7 +318,7 @@ func (r *Runner) runAssignment(ctx context.Context, session ControlPlaneSession,
 	shutdownRequests := make(chan shutdownRequest, 4)
 	monitorCtx, stopMonitor := context.WithCancel(ctx)
 	defer stopMonitor()
-	r.startShutdownMonitor(monitorCtx, session, taskID, payload, shutdownRequests)
+	r.startShutdownMonitor(monitorCtx, session, taskID, payload, cloudVendor, shutdownRequests)
 	if err := r.sendStatus(ctx, session, taskID, workerv1.TaskState_TASK_STATE_PREPARING, "preparing workload"); err != nil {
 		return err
 	}
@@ -557,11 +563,15 @@ func (r *Runner) interruptWorkload(ctx context.Context, taskID string, engine wo
 	}
 }
 
-func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneSession, taskID string, payload []byte, requests chan<- shutdownRequest) {
+func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneSession, taskID string, payload []byte, cloudVendor string, requests chan<- shutdownRequest) {
 	if r.monitorFactory == nil {
 		return
 	}
-	config := workerShutdown.MonitorConfigFromAssignment(payload, r.config.Provider)
+	fallbackProvider := strings.TrimSpace(cloudVendor)
+	if fallbackProvider == "" {
+		fallbackProvider = r.config.Provider
+	}
+	config := workerShutdown.MonitorConfigFromAssignment(payload, fallbackProvider)
 	if r.localState != nil {
 		r.localState.SetShutdownMonitor(config)
 	}

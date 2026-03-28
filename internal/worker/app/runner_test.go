@@ -247,6 +247,83 @@ func TestRunnerStoresWorkerMetadataFromHelloAck(t *testing.T) {
 	}
 }
 
+func TestRunnerUsesCloudVendorForShutdownMonitorFallback(t *testing.T) {
+	t.Parallel()
+
+	state := NewLocalState(LocalStateConfig{
+		APIAddress:        DefaultLocalAPIListenAddress,
+		InstanceID:        "instance-1",
+		Provider:          "aws-default-credentials",
+		WorkerVersion:     "test",
+		ConnectTimeout:    time.Second,
+		HeartbeatInterval: time.Hour,
+	})
+	session := &scriptedSession{
+		messages: []*workerv1.ControlToWorker{
+			{
+				Message: &workerv1.ControlToWorker_HelloAck{
+					HelloAck: &workerv1.HelloAck{
+						WorkerId:             "worker-1",
+						TerminalSessionToken: "terminal-token-1",
+						CloudVendor:          "aws",
+					},
+				},
+			},
+			{
+				Message: &workerv1.ControlToWorker_Assignment{
+					Assignment: &workerv1.Assignment{
+						TaskId:      "task-1",
+						RuntimeKind: workerv1.RuntimeKind_RUNTIME_KIND_EXEC,
+						Payload: `{
+							"command": "true",
+							"shutdown_monitor": {
+								"enabled": true
+							}
+						}`,
+					},
+				},
+			},
+		},
+	}
+
+	client := &fakeControlPlaneClient{session: session}
+	monitorProvider := ""
+	runner, err := NewRunner(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		client,
+		func(context.Context, workerv1.RuntimeKind) (workerRuntime.Engine, error) { return fakeEngine{}, nil },
+		RunnerConfig{
+			InstanceID:        "instance-1",
+			Provider:          "aws-default-credentials",
+			RegistrationToken: "token-1",
+			WorkerVersion:     "test",
+			ConnectTimeout:    time.Second,
+			HeartbeatInterval: time.Hour,
+			LocalState:        state,
+			ShutdownMonitor: func(_ *slog.Logger, reporter workerShutdown.Reporter, config workerShutdown.MonitorConfig) ShutdownMonitor {
+				_ = reporter
+				monitorProvider = config.Provider
+				return fakeShutdownMonitor{}
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewRunner() error = %v", err)
+	}
+
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if monitorProvider != "aws" {
+		t.Fatalf("shutdown monitor provider = %q, want %q", monitorProvider, "aws")
+	}
+
+	snapshot := state.Snapshot()
+	if snapshot.Shutdown.Monitor.Provider != "aws" {
+		t.Fatalf("shutdown monitor snapshot provider = %q, want %q", snapshot.Shutdown.Monitor.Provider, "aws")
+	}
+}
+
 func TestRunnerTimesOutDuringHandshake(t *testing.T) {
 	session := &scriptedSession{
 		receive: func(ctx context.Context) (*workerv1.ControlToWorker, error) {

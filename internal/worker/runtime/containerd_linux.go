@@ -919,8 +919,8 @@ func ensureManagedCNIPlugins(ctx context.Context, logger *slog.Logger, paths man
 
 func ensureManagedContainerdConfig(paths managedContainerdPaths) error {
 	config := strings.Join([]string{
-		"version = 2",
-		`disabled_plugins = ["cri"]`,
+		"version = 3",
+		`disabled_plugins = ["io.containerd.grpc.v1.cri"]`,
 		"",
 	}, "\n")
 	return writeFileAtomically(paths.configPath, []byte(config), 0o644)

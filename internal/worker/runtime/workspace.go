@@ -738,6 +738,14 @@ func resolveContainerSubdir(root string, subdir string) (string, error) {
 }
 
 func ensureDirectory(target string, label string) error {
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		info, statErr := os.Stat(target)
+		if statErr == nil && !info.IsDir() {
+			return fmt.Errorf("%s %q is not a directory", label, target)
+		}
+		return fmt.Errorf("create %s %q: %w", label, target, err)
+	}
+
 	info, err := os.Stat(target)
 	if err != nil {
 		return fmt.Errorf("stat %s %q: %w", label, target, err)

@@ -133,6 +133,57 @@ func TestExtractArchive_RejectsEscapingEntries(t *testing.T) {
 	}
 }
 
+func TestPrepareWorkspaceCreatesRelativeWorkDir(t *testing.T) {
+	t.Parallel()
+
+	workspaceRoot := filepath.Join(t.TempDir(), "workspace")
+	runWorkDir := filepath.Join("app", "build")
+
+	workspace, err := prepareWorkspace(context.Background(), nil, workspaceRoot, nil, runWorkDir)
+	if err != nil {
+		t.Fatalf("prepareWorkspace() error = %v", err)
+	}
+
+	wantHostWorkDir := filepath.Join(workspaceRoot, runWorkDir)
+	if workspace.hostWorkDir != wantHostWorkDir {
+		t.Fatalf("prepareWorkspace() hostWorkDir = %q, want %q", workspace.hostWorkDir, wantHostWorkDir)
+	}
+
+	info, err := os.Stat(workspace.hostWorkDir)
+	if err != nil {
+		t.Fatalf("os.Stat(%q) error = %v", workspace.hostWorkDir, err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("hostWorkDir %q is not a directory", workspace.hostWorkDir)
+	}
+}
+
+func TestPrepareWorkspaceCreatesAbsoluteWorkDir(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	workspaceRoot := filepath.Join(root, "workspace")
+	runWorkDir := filepath.Join(root, "runner", "install")
+
+	workspace, err := prepareWorkspace(context.Background(), nil, workspaceRoot, nil, runWorkDir)
+	if err != nil {
+		t.Fatalf("prepareWorkspace() error = %v", err)
+	}
+
+	wantHostWorkDir := filepath.Clean(runWorkDir)
+	if workspace.hostWorkDir != wantHostWorkDir {
+		t.Fatalf("prepareWorkspace() hostWorkDir = %q, want %q", workspace.hostWorkDir, wantHostWorkDir)
+	}
+
+	info, err := os.Stat(workspace.hostWorkDir)
+	if err != nil {
+		t.Fatalf("os.Stat(%q) error = %v", workspace.hostWorkDir, err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("hostWorkDir %q is not a directory", workspace.hostWorkDir)
+	}
+}
+
 func createZipArchive(archivePath string, entries []archiveTestEntry) error {
 	file, err := os.Create(archivePath)
 	if err != nil {

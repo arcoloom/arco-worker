@@ -568,9 +568,6 @@ func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneS
 		return
 	}
 	fallbackProvider := strings.TrimSpace(cloudVendor)
-	if fallbackProvider == "" {
-		fallbackProvider = r.config.Provider
-	}
 	config := workerShutdown.MonitorConfigFromAssignment(payload, fallbackProvider)
 	if r.localState != nil {
 		r.localState.SetShutdownMonitor(config)

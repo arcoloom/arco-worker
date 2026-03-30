@@ -53,7 +53,6 @@ type localWorkerSnapshot struct {
 	InstanceType     string     `json:"instance_type,omitempty"`
 	Region           string     `json:"region,omitempty"`
 	AvailabilityZone string     `json:"availability_zone,omitempty"`
-	AZ               string     `json:"az,omitempty"`
 	WorkerVersion    string     `json:"worker_version"`
 	ConnectedAt      *time.Time `json:"connected_at,omitempty"`
 	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at,omitempty"`
@@ -226,7 +225,6 @@ func (s *LocalState) MarkWorkerConnected(helloAck *workerv1.HelloAck) {
 	}
 	if availabilityZone := strings.TrimSpace(helloAck.GetAvailabilityZone()); availabilityZone != "" {
 		s.snapshot.Worker.AvailabilityZone = availabilityZone
-		s.snapshot.Worker.AZ = availabilityZone
 	}
 	s.snapshot.Worker.ConnectedAt = &now
 	if s.snapshot.Phase == "" || s.snapshot.Phase == "starting" || s.snapshot.Phase == "connecting" {

@@ -98,7 +98,6 @@ func TestLocalAPIInfoSummarizesTaskAndShutdownState(t *testing.T) {
 			InstanceType     string `json:"instance_type"`
 			Region           string `json:"region"`
 			AvailabilityZone string `json:"availability_zone"`
-			AZ               string `json:"az"`
 			WorkerVersion    string `json:"worker_version"`
 		} `json:"worker"`
 		Task struct {
@@ -166,8 +165,15 @@ func TestLocalAPIInfoSummarizesTaskAndShutdownState(t *testing.T) {
 	if response.Worker.AvailabilityZone != "us-west-2a" {
 		t.Fatalf("availability_zone = %q, want %q", response.Worker.AvailabilityZone, "us-west-2a")
 	}
-	if response.Worker.AZ != "us-west-2a" {
-		t.Fatalf("az = %q, want %q", response.Worker.AZ, "us-west-2a")
+
+	var payload struct {
+		Worker map[string]any `json:"worker"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode info payload: %v", err)
+	}
+	if _, exists := payload.Worker["az"]; exists {
+		t.Fatal("worker.az was present, want field removed from info response")
 	}
 	if response.Task.TaskID != "task-1" {
 		t.Fatalf("task_id = %q, want %q", response.Task.TaskID, "task-1")

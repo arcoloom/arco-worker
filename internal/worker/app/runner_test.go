@@ -242,9 +242,6 @@ func TestRunnerStoresWorkerMetadataFromHelloAck(t *testing.T) {
 	if snapshot.Worker.AvailabilityZone != "us-west-2a" {
 		t.Fatalf("availability_zone = %q, want %q", snapshot.Worker.AvailabilityZone, "us-west-2a")
 	}
-	if snapshot.Worker.AZ != "us-west-2a" {
-		t.Fatalf("az = %q, want %q", snapshot.Worker.AZ, "us-west-2a")
-	}
 }
 
 func TestRunnerUsesCloudVendorForShutdownMonitorFallback(t *testing.T) {

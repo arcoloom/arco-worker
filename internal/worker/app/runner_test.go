@@ -244,7 +244,7 @@ func TestRunnerStoresWorkerMetadataFromHelloAck(t *testing.T) {
 	}
 }
 
-func TestRunnerUsesCloudVendorForShutdownMonitorFallback(t *testing.T) {
+func TestRunnerUsesCloudVendorForShutdownMonitorProvider(t *testing.T) {
 	t.Parallel()
 
 	state := NewLocalState(LocalStateConfig{
@@ -274,7 +274,8 @@ func TestRunnerUsesCloudVendorForShutdownMonitorFallback(t *testing.T) {
 						Payload: `{
 							"command": "true",
 							"shutdown_monitor": {
-								"enabled": true
+								"enabled": true,
+								"provider": "aws-default-credentials"
 							}
 						}`,
 					},
@@ -321,7 +322,7 @@ func TestRunnerUsesCloudVendorForShutdownMonitorFallback(t *testing.T) {
 	}
 }
 
-func TestRunnerDoesNotFallbackToCredentialProviderNameForShutdownMonitor(t *testing.T) {
+func TestRunnerSkipsShutdownMonitorWhenCloudVendorIsUnavailable(t *testing.T) {
 	t.Parallel()
 
 	state := NewLocalState(LocalStateConfig{
@@ -360,7 +361,7 @@ func TestRunnerDoesNotFallbackToCredentialProviderNameForShutdownMonitor(t *test
 	}
 
 	client := &fakeControlPlaneClient{session: session}
-	monitorProvider := "<unset>"
+	monitorStarted := false
 	runner, err := NewRunner(
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		client,
@@ -375,7 +376,8 @@ func TestRunnerDoesNotFallbackToCredentialProviderNameForShutdownMonitor(t *test
 			LocalState:        state,
 			ShutdownMonitor: func(_ *slog.Logger, reporter workerShutdown.Reporter, config workerShutdown.MonitorConfig) ShutdownMonitor {
 				_ = reporter
-				monitorProvider = config.Provider
+				_ = config
+				monitorStarted = true
 				return fakeShutdownMonitor{}
 			},
 		},
@@ -387,13 +389,16 @@ func TestRunnerDoesNotFallbackToCredentialProviderNameForShutdownMonitor(t *test
 	if err := runner.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if monitorProvider != "" {
-		t.Fatalf("shutdown monitor provider = %q, want empty cloud vendor fallback", monitorProvider)
+	if monitorStarted {
+		t.Fatal("shutdown monitor started without cloud vendor, want disabled")
 	}
 
 	snapshot := state.Snapshot()
+	if snapshot.Shutdown.Monitor.Enabled {
+		t.Fatal("shutdown monitor snapshot enabled without cloud vendor, want disabled")
+	}
 	if snapshot.Shutdown.Monitor.Provider != "" {
-		t.Fatalf("shutdown monitor snapshot provider = %q, want empty cloud vendor fallback", snapshot.Shutdown.Monitor.Provider)
+		t.Fatalf("shutdown monitor snapshot provider = %q, want empty provider without cloud vendor", snapshot.Shutdown.Monitor.Provider)
 	}
 }
 
@@ -477,6 +482,7 @@ func TestRunnerStartsShutdownMonitorWhenEnabled(t *testing.T) {
 					HelloAck: &workerv1.HelloAck{
 						WorkerId:             "worker-1",
 						TerminalSessionToken: "terminal-token-1",
+						CloudVendor:          "aws",
 					},
 				},
 			},

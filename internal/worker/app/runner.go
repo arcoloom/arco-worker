@@ -567,8 +567,16 @@ func (r *Runner) startShutdownMonitor(ctx context.Context, session ControlPlaneS
 	if r.monitorFactory == nil {
 		return
 	}
-	fallbackProvider := strings.TrimSpace(cloudVendor)
-	config := workerShutdown.MonitorConfigFromAssignment(payload, fallbackProvider)
+	config := workerShutdown.MonitorConfigFromAssignment(payload, "")
+	config.Provider = strings.TrimSpace(cloudVendor)
+	if config.Enabled && config.Provider == "" {
+		r.logger.InfoContext(
+			context.WithoutCancel(ctx),
+			"shutdown monitor disabled because cloud vendor is unavailable",
+			slog.String("task_id", taskID),
+		)
+		config.Enabled = false
+	}
 	if r.localState != nil {
 		r.localState.SetShutdownMonitor(config)
 	}

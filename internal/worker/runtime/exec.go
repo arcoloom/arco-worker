@@ -21,10 +21,10 @@ import (
 )
 
 const (
-	storageDriverRclone = "rclone"
-	storageMountTool    = "rclone"
-	rcloneDaemonWait    = "30s"
-	rcloneVFSCacheMode  = "writes"
+	storageProtocolS3  = "s3"
+	storageMountTool   = "rclone"
+	rcloneDaemonWait   = "30s"
+	rcloneVFSCacheMode = "writes"
 )
 
 // ExecEngine runs workloads as plain host processes.
@@ -376,12 +376,12 @@ func validateStorageMounts(mounts []StorageMount) error {
 
 	seenPaths := make(map[string]struct{}, len(mounts))
 	for index, mount := range mounts {
-		driver := strings.TrimSpace(mount.Driver)
-		if driver == "" {
-			driver = storageDriverRclone
+		protocol := strings.TrimSpace(mount.Protocol)
+		if protocol == "" {
+			protocol = storageProtocolS3
 		}
-		if !strings.EqualFold(driver, storageDriverRclone) {
-			return fmt.Errorf("mount %d uses unsupported storage driver %q", index+1, mount.Driver)
+		if !strings.EqualFold(protocol, storageProtocolS3) {
+			return fmt.Errorf("mount %d uses unsupported storage protocol %q", index+1, mount.Protocol)
 		}
 
 		if strings.TrimSpace(mount.Bucket) == "" {

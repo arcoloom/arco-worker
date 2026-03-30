@@ -145,7 +145,7 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.ClientCertPath, "client-cert", "", "Path to the PEM-encoded worker client certificate")
 	fs.StringVar(&cfg.ClientKeyPath, "client-key", "", "Path to the PEM-encoded worker client private key")
 	fs.StringVar(&cfg.InstanceID, "instance-id", "", "Arcoloom instance resource identifier")
-	fs.StringVar(&cfg.Provider, "provider", "", "Cloud provider name, for example aws")
+	fs.StringVar(&cfg.Provider, "provider", "", "Provider name, for example arco-provider-aws")
 	fs.StringVar(&cfg.RegistrationToken, "registration-token", "", "Registration token issued by the control plane")
 	fs.StringVar(&cfg.RegistrationTokenFile, "registration-token-file", "", "Path to a file containing the registration token issued by the control plane")
 	fs.StringVar(&cfg.LogLevel, "log-level", "info", "Log level: debug, info, warn, error")

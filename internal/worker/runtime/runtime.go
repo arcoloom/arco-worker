@@ -39,7 +39,7 @@ type LogEmitterAware interface {
 }
 
 type StorageMount struct {
-	Driver          string `json:"driver"`
+	Protocol        string `json:"protocol"`
 	Bucket          string `json:"bucket"`
 	Prefix          string `json:"prefix,omitempty"`
 	Endpoint        string `json:"endpoint"`
